@@ -34,13 +34,19 @@ func InitPoller(state *app.State, mon *monitor.Monitor) *telegram.Poller {
 
 // StartPollerIfEnabled 启动时拉起长轮询。配了 Token 就跑 —— 没有别的模式可选。
 func StartPollerIfEnabled(state *app.State) {
+	StartPollerIfEnabledWithAdmit(state, nil)
+}
+
+// StartPollerIfEnabledWithAdmit 允许调用方传入与停机协调器互斥的持锁准入回调，
+// 确保网络准备完成后、实际进入运行态并拉起轮询循环的瞬间与 beginShutdown 严格互斥。
+func StartPollerIfEnabledWithAdmit(state *app.State, admit func(launch func()) bool) {
 	if globalPoller == nil {
 		return
 	}
 	if strings.TrimSpace(state.Config.Get().TgToken) == "" {
 		return
 	}
-	if err := globalPoller.Start(); err != nil {
+	if err := globalPoller.StartWithAdmit(admit); err != nil {
 		state.Logger.Error("启动 Telegram 长轮询失败: "+err.Error(), "telegram")
 	}
 }

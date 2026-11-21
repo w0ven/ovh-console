@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,7 +40,553 @@ import (
 )
 
 var monitorState *monitor.Monitor
-var appStateForShutdown *app.State
+var appStateForShutdown atomic.Pointer[app.State]
+
+type lifecycleMode uint8
+
+const (
+	lifecycleRunning lifecycleMode = iota
+	lifecycleShuttingDown
+	lifecycleRestarting
+	lifecycleRestartCommitted
+	lifecycleRestartAborted // HTTP排空失败等终态中止：拒绝新的延迟信号登记，不再误吃 SIGTERM
+	lifecycleMaintenance
+)
+
+const (
+	defaultShutdownBudget = 25 * time.Second
+	defaultRestartBudget  = 25 * time.Second
+	persistReserveBudget  = 3 * time.Second
+)
+
+// shutdownCoordinator 是 SIGTERM 优雅退出与自更新重启的唯一生命周期状态所有者：
+// - 同一把锁内完成 running -> shuttingDown / restarting / maintenance 迁移以及信号登记，杜绝双锁竞态；
+// - 唯一负责跟踪在途写请求（trackWrite），在维护态/排空态立刻拒绝新写操作；
+// - 唯一负责记录最终退出码并通过 done 通道交给 main 退出，杜绝退出码竞态；
+// - closeDBOnce 保证数据库最多只关闭一次。
+type shutdownCoordinator struct {
+	mu                sync.Mutex
+	mode              lifecycleMode
+	maintenanceReason string
+	done              chan struct{}
+	deadline          time.Time
+	deadlineGen       uint64
+	deadlineUpdated   chan struct{}
+	sigCh             <-chan os.Signal
+	shutdownBudget    time.Duration
+	restartArbiter    func(target lifecycleMode) (transitioned bool, sig string, deadline time.Time)
+	sigtermDeferred   string
+	sigtermDeadline   time.Time
+	exitCode          int
+	inFlightWrites    int
+	writesDrained     chan struct{}
+	startupActive     bool
+	startupDone       chan struct{}
+	finishOnce        sync.Once
+	closeDBOnce       sync.Once
+	closeDBErr        error
+}
+
+func newShutdownCoordinator() *shutdownCoordinator {
+	return &shutdownCoordinator{
+		mode:            lifecycleRunning,
+		done:            make(chan struct{}),
+		deadlineUpdated: make(chan struct{}),
+		shutdownBudget:  defaultShutdownBudget,
+	}
+}
+
+// notifyDeadlineUpdatedLocked 在持锁更新 deadline 时递增代次并广播唤醒 waitMainLifecycleExit 重新计时。
+func (c *shutdownCoordinator) notifyDeadlineUpdatedLocked() {
+	c.deadlineGen++
+	if c.deadlineUpdated != nil {
+		close(c.deadlineUpdated)
+	}
+	c.deadlineUpdated = make(chan struct{})
+}
+
+// beginShutdown 在单次持锁内完成 SIGTERM/SIGINT 归属判定：
+// 若当前为 running 或 maintenance，直接赢得退出权；若当前为 restarting，在同一次持锁内登记延迟信号，杜绝丢信号。
+func (c *shutdownCoordinator) beginShutdown(sig string, budget time.Duration) (won bool, deadline time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.mode {
+	case lifecycleRunning, lifecycleMaintenance:
+		c.mode = lifecycleShuttingDown
+		c.deadline = time.Now().Add(budget)
+		c.notifyDeadlineUpdatedLocked()
+		return true, c.deadline
+	case lifecycleRestarting:
+		if c.sigtermDeferred == "" {
+			c.sigtermDeferred = sig
+			c.sigtermDeadline = time.Now().Add(budget)
+		}
+		return false, c.deadline
+	default:
+		return false, c.deadline
+	}
+}
+
+func (c *shutdownCoordinator) beginRestart(budget time.Duration) (won bool, deadline time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRunning {
+		return false, c.deadline
+	}
+	c.mode = lifecycleRestarting
+	c.deadline = time.Now().Add(budget)
+	c.notifyDeadlineUpdatedLocked()
+	return true, c.deadline
+}
+
+// abortRestartOrTakeDeferredShutdown 在 HTTP 排空超时后准备进入不可逆失败退出前执行原子裁决：
+// 若已注册 startSignalHandler 单协程裁决器，交由该唯一信号协程串行裁决；否则直接锁内裁决。
+// - 若此前已登记延迟 SIGTERM/SIGINT，切入 lifecycleShuttingDown 并交出信号继续排空；
+// - 否则切入 lifecycleRestartAborted，封死后续一切延迟信号登记窗口，保证“已登记的信号必有消费者，未登记则不会再被登记”。
+func (c *shutdownCoordinator) abortRestartOrTakeDeferredShutdown() (aborted bool, sig string, deadline time.Time) {
+	c.mu.Lock()
+	arbiter := c.restartArbiter
+	c.mu.Unlock()
+	if arbiter != nil {
+		return arbiter(lifecycleRestartAborted)
+	}
+	return c.transitionRestartTerminalDirect(lifecycleRestartAborted)
+}
+
+// isShutdownRequested 判断协调器是否已离开正常启动/运行态（用于主协程启动每个后台 worker 前检查是否已有停机信号抢先接管）。
+func (c *shutdownCoordinator) isShutdownRequested() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mode != lifecycleRunning
+}
+
+// beginStartupPhase 与 finishStartupPhase 构成“后台服务启动阶段”和“优雅停机排空”之间的严格同步屏障：
+//   - 主协程仅当 coord.mode == lifecycleRunning 时获准进入启动阶段；若 SIGTERM 已经提前接管，直接返回 false 跳过所有启动。
+//   - 一旦获准进入，gracefulShutdownWithCoordinator 必须先等待 waitStartupPhaseDone(drainCtx) 再执行 stopAllBackgroundLoops，
+//     彻底消除“主协程刚读完 running、信号协程切入 shuttingDown 并跑完 Stop，主协程再调用 mon.Start()/vps.Start()/StartPollerIfEnabled”的并发窗口！
+func (c *shutdownCoordinator) beginStartupPhase() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRunning {
+		return false
+	}
+	c.startupActive = true
+	if c.startupDone == nil {
+		c.startupDone = make(chan struct{})
+	}
+	return true
+}
+
+func (c *shutdownCoordinator) finishStartupPhase() {
+	c.mu.Lock()
+	if c.startupActive {
+		c.startupActive = false
+		if c.startupDone != nil {
+			close(c.startupDone)
+			c.startupDone = nil
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *shutdownCoordinator) waitStartupPhaseDone(ctx context.Context) bool {
+	c.mu.Lock()
+	if !c.startupActive || c.startupDone == nil {
+		c.mu.Unlock()
+		return true
+	}
+	ch := c.startupDone
+	c.mu.Unlock()
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// runStartupUnitLocked 在 coord.mu 与启动屏障共同保护下串行执行单个短启动登记（如 mon.Start / vps.Start / 派发后台协程）：
+// 仅当此刻仍处于 lifecycleRunning 时才允许启动；一旦停机开始，后续任意未开始的启动单元全部被原子跳过。
+func (c *shutdownCoordinator) runIfRunning(fn func()) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRunning {
+		return false
+	}
+	fn()
+	return true
+}
+
+// validateStartupAuthPolicy 校验生产启动时的鉴权与监听地址组合：
+// 当启用 API Key 鉴权且使用公开默认密钥 "123456" 并暴露到非回环监听地址时，直接拒绝启动（除非显式设置 OVH_ALLOW_DEFAULT_KEY_REMOTE=true）。
+func validateStartupAuthPolicy(enableAuth bool, apiKey, listenHost string, allowDefaultRemote bool) error {
+	if !enableAuth || apiKey != "123456" || allowDefaultRemote {
+		return nil
+	}
+	h := strings.TrimSpace(listenHost)
+	h = strings.Trim(h, "[]")
+	if h == "127.0.0.1" || h == "::1" || strings.EqualFold(h, "localhost") {
+		return nil
+	}
+	return fmt.Errorf("拒绝启动：启用鉴权时正在使用公开默认 API_SECRET_KEY=123456 且 LISTEN_HOST=%q 非本机回环地址；请在 .env 或环境变量中设置强随机 API_SECRET_KEY（或仅将 LISTEN_HOST 绑定到 127.0.0.1；本地调试如确需放行请显式设置 OVH_ALLOW_DEFAULT_KEY_REMOTE=true）", listenHost)
+}
+
+// takeDeferredShutdown 在重启准备进入不可逆关停（关 HTTP / 关库 / 替换进程）前原子检查是否有延迟登记的 SIGTERM/SIGINT。
+// 若存在，在同一把锁内直接切入 lifecycleShuttingDown、广播新 deadline 并交出信号名与截止时间，防止优雅停机信号被重启流程吞掉。
+func (c *shutdownCoordinator) takeDeferredShutdown() (sig string, deadline time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRestarting || c.sigtermDeferred == "" {
+		return "", time.Time{}
+	}
+	sig = c.sigtermDeferred
+	dl := c.sigtermDeadline
+	if dl.IsZero() {
+		dl = c.deadline
+	}
+	c.sigtermDeferred = ""
+	c.sigtermDeadline = time.Time{}
+	c.mode = lifecycleShuttingDown
+	c.deadline = dl
+	c.notifyDeadlineUpdatedLocked()
+	return sig, dl
+}
+
+// setRestartArbiter 由 startSignalHandler 注册单协程裁决器；
+// 绑定后，commitRestartOrTakeDeferredShutdown 会将最终提交请求交由该唯一信号协程串行执行，
+// 彻底消灭“信号已被另一协程从 sigCh 读走、正在调用 String() 尚未登记，重启却同时提交”的竞态窗口。
+func (c *shutdownCoordinator) setRestartArbiter(fn func(target lifecycleMode) (bool, string, time.Time)) {
+	c.mu.Lock()
+	c.restartArbiter = fn
+	c.mu.Unlock()
+}
+
+func (c *shutdownCoordinator) clearRestartArbiter() {
+	c.mu.Lock()
+	c.restartArbiter = nil
+	c.mu.Unlock()
+}
+
+// attachSignalChannel 将进程信号通道与停机预算绑定到协调器（供统一裁决路径对缓冲信号使用完整停机预算）。
+func (c *shutdownCoordinator) attachSignalChannel(ch <-chan os.Signal, budget ...time.Duration) {
+	c.mu.Lock()
+	c.sigCh = ch
+	if len(budget) > 0 && budget[0] > 0 {
+		c.shutdownBudget = budget[0]
+	}
+	c.mu.Unlock()
+}
+
+// setShutdownBudget 记录本次运行的停机信号预算，保证所有裁决点（含从 sigCh 直接读取缓冲信号）均授予完整停机预算。
+func (c *shutdownCoordinator) setShutdownBudget(budget time.Duration) {
+	if budget <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.shutdownBudget = budget
+	c.mu.Unlock()
+}
+
+// commitRestartEnterHook 仅供单测确认重启协程已实际抵达提交入口（生产环境为 nil）。
+var commitRestartEnterHook atomic.Pointer[func()]
+
+// commitRestartOrTakeDeferredShutdown 是进入不可逆 exec/spawn 前的最终原子提交点：
+// 若已注册 startSignalHandler 裁决器，交由唯一的信号协程串行裁决（零竞态窗口）；否则直接锁内裁决。
+func (c *shutdownCoordinator) commitRestartOrTakeDeferredShutdown() (committed bool, sig string, deadline time.Time) {
+	if h := commitRestartEnterHook.Load(); h != nil && *h != nil {
+		(*h)()
+	}
+	c.mu.Lock()
+	arbiter := c.restartArbiter
+	c.mu.Unlock()
+	if arbiter != nil {
+		return arbiter(lifecycleRestartCommitted)
+	}
+	return c.transitionRestartTerminalDirect(lifecycleRestartCommitted)
+}
+
+// transitionRestartTerminalDirect 在单把 coord.mu 锁内完成重启向指定终态（lifecycleRestartCommitted / lifecycleRestartAborted）的原子切换或延迟停机交接。
+// 关键修复：若在两步读取之间 sigCh 恰好缓冲到了新信号，使用完整停机预算（time.Now().Add(c.shutdownBudget)），绝不继承即将耗尽的旧重启 deadline！
+func (c *shutdownCoordinator) transitionRestartTerminalDirect(target lifecycleMode) (transitioned bool, sig string, deadline time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRestarting {
+		return false, "", time.Time{}
+	}
+	if c.sigtermDeferred == "" && c.sigCh != nil {
+		select {
+		case s, ok := <-c.sigCh:
+			if ok && s != nil {
+				c.sigtermDeferred = s.String()
+				b := c.shutdownBudget
+				if b <= 0 {
+					b = defaultShutdownBudget
+				}
+				c.sigtermDeadline = time.Now().Add(b)
+			}
+		default:
+		}
+	}
+	if c.sigtermDeferred != "" {
+		sig = c.sigtermDeferred
+		dl := c.sigtermDeadline
+		if dl.IsZero() {
+			b := c.shutdownBudget
+			if b <= 0 {
+				b = defaultShutdownBudget
+			}
+			dl = time.Now().Add(b)
+		}
+		c.sigtermDeferred = ""
+		c.sigtermDeadline = time.Time{}
+		c.mode = lifecycleShuttingDown
+		c.deadline = dl
+		c.notifyDeadlineUpdatedLocked()
+		return false, sig, dl
+	}
+	c.mode = target
+	return true, "", time.Time{}
+}
+
+// enterMaintenance 在自更新排空超时或关键落库异常时转入可观测维护态（拒绝新的副作用写请求）。
+// 若等待期间已登记 SIGTERM，则在同一次持锁内直接切入 shuttingDown、广播新 deadline 并返回信号名。
+func (c *shutdownCoordinator) enterMaintenance(reason string) (deferredSig string, deadline time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != lifecycleRestarting {
+		return "", time.Time{}
+	}
+	c.maintenanceReason = reason
+	if c.sigtermDeferred != "" {
+		sig := c.sigtermDeferred
+		dl := c.sigtermDeadline
+		if dl.IsZero() {
+			dl = c.deadline
+		}
+		c.sigtermDeferred = ""
+		c.sigtermDeadline = time.Time{}
+		c.mode = lifecycleShuttingDown
+		c.deadline = dl
+		c.notifyDeadlineUpdatedLocked()
+		return sig, dl
+	}
+	c.mode = lifecycleMaintenance
+	c.deadline = time.Time{}
+	c.notifyDeadlineUpdatedLocked()
+	return "", time.Time{}
+}
+
+// tryAcquireWrite 供 HTTP 写请求中间件调用：仅在 lifecycleRunning 状态下放行并登记在途写请求；
+// 进入重启/退出/维护态后立即拒绝新写请求（返回 503），同时等待已进入的在途写请求全部完成。
+func (c *shutdownCoordinator) tryAcquireWrite() (release func(), allowed bool, reason string) {
+	c.mu.Lock()
+	if c.mode != lifecycleRunning {
+		r := c.maintenanceReason
+		if r == "" {
+			r = "服务正在退出或更新重启中，暂不接受新写入请求"
+		}
+		c.mu.Unlock()
+		return nil, false, r
+	}
+	c.inFlightWrites++
+	c.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			c.inFlightWrites--
+			if c.inFlightWrites == 0 && c.writesDrained != nil {
+				close(c.writesDrained)
+				c.writesDrained = nil
+			}
+			c.mu.Unlock()
+		})
+	}, true, ""
+}
+
+// waitWritesDrained 等待所有已放行的在途 HTTP 写请求收尾，返回是否全部在 ctx 截止前完成。
+func (c *shutdownCoordinator) waitWritesDrained(ctx context.Context) bool {
+	c.mu.Lock()
+	if c.inFlightWrites == 0 {
+		c.mu.Unlock()
+		return true
+	}
+	ch := c.writesDrained
+	if ch == nil {
+		ch = make(chan struct{})
+		c.writesDrained = ch
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *shutdownCoordinator) writeGateMiddleware() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		switch ctx.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			ctx.Next()
+			return
+		}
+		// 仅拦截业务写操作；鉴权放行后已到达这里
+		release, ok, reason := c.tryAcquireWrite()
+		if !ok {
+			ctx.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"success":     false,
+				"error":       reason,
+				"maintenance": true,
+			})
+			return
+		}
+		defer release()
+		ctx.Next()
+	}
+}
+
+func (c *shutdownCoordinator) state() (mode lifecycleMode, done <-chan struct{}, deadline time.Time, exitCode int, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mode, c.done, c.deadline, c.exitCode, c.maintenanceReason
+}
+
+func (c *shutdownCoordinator) stateWithDeadlineSignal() (mode lifecycleMode, done <-chan struct{}, deadline time.Time, deadlineGen uint64, deadlineChanged <-chan struct{}, exitCode int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mode, c.done, c.deadline, c.deadlineGen, c.deadlineUpdated, c.exitCode
+}
+
+// isDeadlineStillCurrentAndExpired 在锁内二次复核本轮观察到的 deadlineGen 是否仍是当前有效代次且确已超过 deadline+grace；
+// 消除“旧 timer.C 与新 deadlineChanged 同时就绪时 Go select 随机选到旧 timer.C 误返回 1”的竞态窗口。
+func (c *shutdownCoordinator) isDeadlineStillCurrentAndExpired(observedGen uint64, grace time.Duration) (expired bool, finished bool, exitCode int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.done:
+		return false, true, c.exitCode
+	default:
+	}
+	if c.mode != lifecycleShuttingDown && c.mode != lifecycleRestarting && c.mode != lifecycleRestartCommitted && c.mode != lifecycleRestartAborted {
+		return false, true, 0
+	}
+	if c.deadlineGen != observedGen {
+		return false, false, 0
+	}
+	return !time.Now().Before(c.deadline.Add(grace)), false, 0
+}
+
+func (c *shutdownCoordinator) finish(exitCode int) {
+	c.finishOnce.Do(func() {
+		c.mu.Lock()
+		c.exitCode = exitCode
+		c.mu.Unlock()
+		close(c.done)
+	})
+}
+
+func (c *shutdownCoordinator) closeDB(sqlDB io.Closer) (performed bool, err error) {
+	if sqlDB == nil {
+		return false, nil
+	}
+	c.closeDBOnce.Do(func() {
+		performed = true
+		c.closeDBErr = sqlDB.Close()
+	})
+	return performed, c.closeDBErr
+}
+
+// runBounded 在截止时间 ctx 约束下执行可能阻塞的收尾步骤（如关库/刷盘），
+// 若 ctx 在调用前已过期则直接返回 (false, ctx.Err())，绝不额外拉起注定超时的孤儿协程（防止并发 Close 等副作用）。
+func runBounded(ctx context.Context, fn func() error) (completed bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	ch := make(chan error, 1)
+	go func() {
+		ch <- fn()
+	}()
+	select {
+	case e := <-ch:
+		return true, e
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+var (
+	bgLoopsMu     sync.Mutex
+	bgLoopsCancel context.CancelFunc
+	bgLoopsDone   []<-chan struct{}
+)
+
+func registerBackgroundLoops(cancel context.CancelFunc, done ...<-chan struct{}) {
+	bgLoopsMu.Lock()
+	bgLoopsCancel = cancel
+	bgLoopsDone = append([]<-chan struct{}(nil), done...)
+	bgLoopsMu.Unlock()
+}
+
+// stopRegisteredBackgroundLoops 取消并等待全部已注册后台循环退出，返回是否全部在 ctx 截止前干净退出。
+// 不提前清空 bgLoopsDone，避免并发或重入调用误判为“已完成”。
+func stopRegisteredBackgroundLoops(ctx context.Context, lg *logger.Logger) bool {
+	bgLoopsMu.Lock()
+	cancel := bgLoopsCancel
+	doneChans := append([]<-chan struct{}(nil), bgLoopsDone...)
+	bgLoopsMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	for _, ch := range doneChans {
+		if ch == nil {
+			continue
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
+}
+
+func buildTrustedProxyChecker(trusted []string) func(string) bool {
+	var ips []net.IP
+	var nets []*net.IPNet
+	for _, entry := range trusted {
+		if _, cidr, err := net.ParseCIDR(entry); err == nil {
+			nets = append(nets, cidr)
+			continue
+		}
+		if ip := net.ParseIP(entry); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 && len(nets) == 0 {
+		return nil
+	}
+	return func(remoteIP string) bool {
+		ip := net.ParseIP(strings.TrimSpace(remoteIP))
+		if ip == nil {
+			return false
+		}
+		for _, allowed := range ips {
+			if allowed.Equal(ip) {
+				return true
+			}
+		}
+		for _, cidr := range nets {
+			if cidr.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+}
 
 func main() {
 	// envPath 就是 godotenv 读的那个文件。密钥自动生成时会追加到这里,
@@ -94,6 +642,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 统一由 coord 唯一拥有数据库关闭权：无论正常返回、早期启动失败还是 SIGTERM/自更新收尾，均通过 coord.closeDB(sqliteDB) 的 sync.Once 保证只关闭一次。
+	coord := newShutdownCoordinator()
+	exitProcess := func(code int) {
+		_, _ = coord.closeDB(sqliteDB)
+		os.Exit(code)
+	}
+	defer func() {
+		_, _ = coord.closeDB(sqliteDB)
+	}()
+
 	// 密钥是刚生成的、库里却已经有密文 —— 说明原来那把钥匙丢了。
 	// 直接起来的话程序看着一切正常，只是每次调 OVH 都报签名错误，
 	// 没人猜得到是密钥问题；更糟的是用户会重新录入凭据把旧密文覆盖掉，
@@ -105,11 +663,9 @@ func main() {
 			console.Error("怎么办：把原来的 " + secret.KeyEnv + " 那一行放回 " + envPath +
 				"（或用环境变量传进来）；确实找不回来就设 OVH_DB_KEY_RESET=1 启动，" +
 				"那些账户需要重新录入 OVH 凭据")
-			sqliteDB.Close()
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
-	defer sqliteDB.Close()
 
 	// 老库升级:把已有的明文凭据就地加密。幂等,不迁移也能跑(读的时候兼容明文)
 	if n, merr := sqliteDB.EncryptExistingSecrets(); merr != nil {
@@ -119,13 +675,14 @@ func main() {
 	}
 
 	lg := logger.New(paths.LogFile("app.log.json"), console)
+	lg.StartAutoFlush()
 	cfgStore := config.New(sqliteDB)
 	state := app.NewState(paths, cfgStore, lg, sqliteDB)
 	state.OrderPrewarm = purchase.NewCartPool(state)
 	apiKey, generatedAPIKey, err := auth.ResolveAPIKey(paths.DataDir, os.Getenv("API_SECRET_KEY"))
 	if err != nil {
 		console.Error("无法安全初始化 API 密钥,已停止启动", "err", err)
-		os.Exit(1)
+		exitProcess(1)
 	}
 	state.APIKey = apiKey
 	if generatedAPIKey {
@@ -158,10 +715,10 @@ func main() {
 	if updater.RollbackIfStale(state) {
 		if exe, err := os.Executable(); err == nil {
 			console.Warn("已回滚到更新前的版本，正在用它重启")
-			_ = sqliteDB.Close()
+			_, _ = coord.closeDB(sqliteDB)
 			if err := updater.Restart(exe); err != nil {
 				console.Error("回滚后重启失败", "err", err)
-				os.Exit(1)
+				exitProcess(1)
 			}
 		}
 	}
@@ -174,7 +731,7 @@ func main() {
 	// 监控器
 	mon := monitor.New(state)
 	monitorState = mon
-	appStateForShutdown = state
+	appStateForShutdown.Store(state)
 	// 删账户的级联清理需要摸到监控内存(SQL 清了、内存不清会被 SaveToDB 写回)
 	handlers.SetMonitorRef(mon)
 	mon.LoadFromDB()
@@ -202,9 +759,14 @@ func main() {
 	}
 	if err := r.SetTrustedProxies(trusted); err != nil {
 		_ = r.SetTrustedProxies(nil)
+		handlers.SetTrustedProxyChecker(nil)
 		console.Warn("SetTrustedProxies 失败,将按不信任代理处理", "err", err)
+	} else {
+		handlers.SetTrustedProxyChecker(buildTrustedProxyChecker(trusted))
 	}
 	r.Use(gin.Recovery())
+	r.Use(auth.SecurityHeaders())
+	r.Use(coord.writeGateMiddleware())
 	r.Use(auth.LimitRequestBody(4 << 20))
 	// CORS 只放行同机来源。
 	//
@@ -593,261 +1155,948 @@ func main() {
 	// 前端静态文件（仅 `-tags ui` 构建时生效）
 	mountEmbeddedUI(r)
 
-	// 后台线程
-	go purchase.ProcessQueueLoop(state)
-	// 定时刷新历史里未到终态订单的支付状态(付款发生在下单之后的任意时刻)
-	go purchase.OrderStatusLoop(state)
-	// 预热各账户子公司的区域配置:region 的合法取值要从 10MB 的公开目录里解析,
-	// 首次解析放在抢购链路上会白白慢 2-7 秒
-	go catalog.WarmRegionCache(state)
-	// 按账户的出站代理看门狗:代理连续挂掉就暂停那个账户的任务并通知用户。
-	//
-	// 必须在任何 OVH 调用之前接好 —— SetProxyErrorHook 会清掉已缓存的 client
-	// 让它们带着钩子重建,晚接的话前面那些请求的故障就丢了。
+	// 1. 先做启动安全策略校验与端口监听，再安装信号处理器，最后才启动任何有副作用的后台抢购/监控/轮询协程！
+	//    - 启用鉴权 + 默认密钥 123456 + 非回环监听地址（如 LISTEN_HOST=""）时直接拒绝启动，彻底消灭“公网默认密码接管 OVH 账户”窗口；
+	//    - 若端口绑定重试耗尽失败，此时后台 worker 尚未启动、没有活跃写库协程，可直接安全关库并退出。
+	host := os.Getenv("LISTEN_HOST")
+	addr := host + ":" + state.Port
+	if !enableAuth {
+		console.Error("⚠️  API 密钥校验已关闭(ENABLE_API_KEY_AUTH=false):任何人都能调用全部接口,包括下单和重装。仅限本地调试")
+	} else if err := validateStartupAuthPolicy(enableAuth, state.APIKey, host, isTrue(os.Getenv("OVH_ALLOW_DEFAULT_KEY_REMOTE"))); err != nil {
+		console.Error(err.Error())
+		state.Logger.Error(err.Error(), "system")
+		state.Logger.Flush()
+		exitProcess(1)
+	} else if state.APIKey == "123456" {
+		console.Warn("⚠️  当前仅监听本机回环地址并使用了默认 API 密钥 123456 —— 仍建议尽快在 .env 中设置随机 API_SECRET_KEY")
+	}
+	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
+
+	ln, err := listenWithRetry(addr, state)
+	if err != nil {
+		console.Error("启动失败:端口没能绑上", "addr", addr, "err", err)
+		state.Logger.Error("启动失败,端口 "+addr+" 没能绑上: "+err.Error(), "system")
+		state.Logger.Flush()
+		exitProcess(1)
+	}
+
+	// 2. 在启动任何有副作用的后台抢购/监控/轮询协程之前，先注册停机信号处理器与优雅重启钩子！
+	//    若此刻恰好收到 SIGTERM/SIGINT，协调器立刻切入 lifecycleShuttingDown，后续将跳过所有后台 worker 启动并走完整优雅收尾。
+	gracefulRestart = func(exe string) {
+		executeGracefulRestart(coord, srv, sqliteDB, state.Logger, console, exe, defaultRestartBudget, updater.Restart, updater.Spawn)
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	coord.attachSignalChannel(sigCh, defaultShutdownBudget)
+	startSignalHandler(sigCh, coord, srv, sqliteDB, state.Logger, console, defaultShutdownBudget)
+
+	// 3. 端口与信号通道双双就绪后，通过 coord.beginStartupPhase() / finishStartupPhase() 与停机排空严格同步：
+	//    - 若停机已开始，beginStartupPhase() 返回 false，直接跳过所有后台启动；
+	//    - 一旦进入启动阶段，所有后台协程/poller/monitor/vps 的派发均在启动屏障与 coord.runIfRunning 保护下执行，
+	//      且 gracefulShutdownWithCoordinator 必须等待 waitStartupPhaseDone 后才执行 stopAllBackgroundLoops，
+	//      彻底杜绝“停机 Stop 已执行完，主协程才刚调用 StartPollerIfEnabled / mon.Start / vps.Start”的乱序竞态！
 	proxyguard.Init(state)
 	proxyguard.SetDisableAutoOrder(mon.DisableAutoOrderForAccount)
 	proxyguard.SetReload(func() {
-		// 库里关掉了自动下单,内存里的 Monitor 还拿着旧值 —— 不重读的话
-		// 自动下单会继续触发,而它的出口已经断了。
 		mon.LoadFromDB()
 	})
 	state.OVH.SetProxyErrorHook(proxyguard.Report)
-	// 不带凭据但仍打 OVH 的那些请求(公开目录、VPS 可用性轮询)也要上报
 	state.SetProxyErrorHook(proxyguard.Report)
-	// 公开目录/区域探测这类跨账户共享的请求走统一出口:默认账户配了代理就用它,
-	// 否则直连。这不是按账户隔离(共享缓存本来就没这个维度),
-	// 只是别拿本机真实 IP 去打 OVH。
 	applySharedProxy(state)
 	state.OVH.SetLogf(func(format string, args ...interface{}) {
 		state.Logger.Warn(fmt.Sprintf(format, args...), "proxy")
 	})
 
-	// 长轮询:配了 Token 就拉起来。
-	// 内部会先 deleteWebhook —— 老版本可能在 Telegram 那边注册过 webhook,
-	// 不摘掉的话 getUpdates 会一直失败。
-	handlers.InitPoller(state, mon)
-	go handlers.StartPollerIfEnabled(state)
-	// 把命令菜单推给 Telegram,用户打 "/" 就能看到能用什么(以前一条都没注册过)
-	go telegram.RegisterCommands(state)
-	// 服务器目录走懒加载：访问到且缓存过期时才打 OVH，无后台定时刷新
-
-	// 自动启动监控（如果有订阅）。VPS 侧与服务器侧同口径:
-	// 之前 VPS 循环只在手动添加订阅时才启动,重启/自更新重启后订阅还在但循环死了,
-	// 用户以为 VPS 抢购在跑,实际完全静默失效
-	if len(mon.Snapshot()) > 0 && mon.AutoStartAllowed() {
-		mon.Start()
-		state.Logger.Info("自动启动服务器监控", "system")
-	}
-	if len(state.VPSSubscriptions) > 0 && vps.AutoStartAllowed(state) {
-		if vps.Start(state) {
-			state.Logger.Info("自动启动 VPS 监控", "system")
+	if !coord.beginStartupPhase() {
+		_ = ln.Close()
+		if code := waitMainLifecycleExit(coord); code != 0 {
+			os.Exit(code)
 		}
+		return
+	}
+
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	queueLoopDone := make(chan struct{})
+	orderStatusDone := make(chan struct{})
+	warmRegionDone := make(chan struct{})
+	cleanupPairingDone := make(chan struct{})
+	updateCheckDone := make(chan struct{})
+	pollerBootDone := make(chan struct{})
+	tgCmdBootDone := make(chan struct{})
+	registerBackgroundLoops(bgCancel, queueLoopDone, orderStatusDone, warmRegionDone, cleanupPairingDone, updateCheckDone, pollerBootDone, tgCmdBootDone)
+
+	go func() {
+		defer close(queueLoopDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		purchase.ProcessQueueLoopWithContext(bgCtx, state)
+	}()
+	go func() {
+		defer close(orderStatusDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		purchase.OrderStatusLoopWithContext(bgCtx, state)
+	}()
+	go func() {
+		defer close(warmRegionDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		catalog.WarmRegionCacheWithContext(bgCtx, state)
+	}()
+	go func() {
+		defer close(cleanupPairingDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bgCtx.Done():
+				return
+			case <-ticker.C:
+				state.DB.CleanupPairingCodesContext(bgCtx)
+			}
+		}
+	}()
+	go func() {
+		defer close(updateCheckDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		handlers.StartUpdateCheckLoopWithContext(bgCtx, state)
+	}()
+
+	handlers.InitPoller(state, mon)
+	if !coord.runIfRunning(func() {
+		go func() {
+			defer close(pollerBootDone)
+			if coord.isShutdownRequested() {
+				return
+			}
+			// 锁外完成 deleteWebhook 网络准备，发布运行态并拉起轮询循环的瞬间在 coord.runIfRunning 锁内与 beginShutdown 严格互斥：
+			// 若停机已在准备期间接管，admit 返回 false，绝不进入运行态也绝不启动轮询循环！
+			handlers.StartPollerIfEnabledWithAdmit(state, coord.runIfRunning)
+		}()
+		go func() {
+			defer close(tgCmdBootDone)
+			if coord.isShutdownRequested() {
+				return
+			}
+			telegram.RegisterCommands(state)
+		}()
+	}) {
+		close(pollerBootDone)
+		close(tgCmdBootDone)
+	}
+
+	coord.runIfRunning(func() {
+		if len(mon.Snapshot()) > 0 && mon.AutoStartAllowed() {
+			mon.Start()
+			state.Logger.Info("自动启动服务器监控", "system")
+		}
+	})
+	coord.runIfRunning(func() {
+		if len(state.VPSSubscriptions) > 0 && vps.AutoStartAllowed(state) {
+			if vps.Start(state) {
+				state.Logger.Info("自动启动 VPS 监控", "system")
+			}
+		}
+	})
+
+	// 解除启动屏障：自此之后绝不会再有新的后台组件启动，停机排空即可安全执行 stopAllBackgroundLoops
+	coord.finishStartupPhase()
+
+	if coord.isShutdownRequested() {
+		bgCancel()
+		_ = ln.Close()
+		if code := waitMainLifecycleExit(coord); code != 0 {
+			os.Exit(code)
+		}
+		return
 	}
 
 	state.Logger.Info("Server started", "system")
-	// 默认监听所有网卡（双栈 IPv4+IPv6），这样 localhost / 127.0.0.1 / 局域网 IP 都能访问。
-	// Windows 上 localhost 常先解析到 ::1，单绑 127.0.0.1 会被浏览器拒连。
-	// 如果只想锁本机回环，设 LISTEN_HOST=127.0.0.1
-	host := os.Getenv("LISTEN_HOST")
-	addr := host + ":" + state.Port
-	// 安全告警必须在监听之前、而且要显眼。
-	// 数据库密钥那套(密文对不上直接拒绝启动)的标准,鉴权这边一直没有:
-	// 「默认密钥 123456」+「LISTEN_HOST 空 = 所有网卡」组合起来,
-	// 装完就是一台任何人都能操作 OVH 账户的机器,而启动日志一个字都不提。
-	if !enableAuth {
-		console.Error("⚠️  API 密钥校验已关闭(ENABLE_API_KEY_AUTH=false):任何人都能调用全部接口,包括下单和重装。仅限本地调试")
-	} else if state.APIKey == "123456" {
-		console.Error("⚠️  正在使用默认 API 密钥 123456 —— 请立刻在 .env 里设置 API_SECRET_KEY")
-		if host == "" {
-			console.Error("⚠️  并且监听所有网卡(LISTEN_HOST 为空):同网段任何人都能用默认密钥操作你的 OVH 账户")
-		}
-	}
-	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
-
-	// 端口真正 Listen 成功之后才标记"这一版能跑" —— 此时数据库已打开、路由已注册、
-	// 端口也占上了。太早标记等于没验证:启动就 panic、端口被占、数据库损坏,
-	// 恰恰是最需要回滚的几种情况。
-	//
-	// 自己 Listen 而不是用 ListenAndServe + sleep:后者只能靠"睡几秒应该起来了"猜,
-	// 猜早了端口还没占上就宣布健康,猜晚了这几秒里被重启一次就会被误判成启动失败。
-	// 拿到 listener 就是确凿的成功信号,没有窗口。
-	ln, err := listenWithRetry(addr, state)
-	if err != nil {
-		// 这里失败就是整个程序没起来。以前"Listening"和"Server started"两行
-		// 打在 Listen **之前**,于是端口被占时日志上写着启动成功、实际进程已经退了 ——
-		// 自更新失败最难查的就是这一点。
-		console.Error("启动失败:端口没能绑上", "addr", addr, "err", err)
-		state.Logger.Error("启动失败,端口 "+addr+" 没能绑上: "+err.Error(), "system")
-		state.Logger.Flush()
-		os.Exit(1)
-	}
 	console.Info("Listening", "addr", addr, "auth", enableAuth, "ui", hasUI(), "dataDir", paths.DataDir)
 	state.Logger.Info("已监听 "+addr+",开始对外服务", "system")
 	updater.MarkHealthy(state)
 
-	// 后台:每小时清一次过期的 App 配对码(2 分钟有效,留 1 小时缓冲给排查)
-	go func() {
-		for range time.Tick(time.Hour) {
-			state.DB.CleanupPairingCodes()
-		}
-	}()
-
-	// 自更新完成后走这里:先停止接受新请求并等在途请求收尾,再关数据库,最后换进程映像。
-	// 顺序不能反 —— 先 exec 的话,新进程会发现端口还被自己占着。
-	gracefulRestart = func(exe string) {
-		// 必须在 Shutdown 之前置位:Shutdown 会让主 goroutine 里的 Serve 立刻返回,
-		// 而主 goroutine 要靠这个标记知道"别退出,等我 exec"。
-		restartPending.Store(true)
-
-		state.Logger.Info("[更新] 正在优雅关闭以完成重启", "version")
-		state.Logger.Flush()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			console.Warn("shutdown", "err", err)
-		}
-		if err := sqliteDB.Close(); err != nil {
-			console.Warn("close sqlite", "err", err)
-		}
-
-		// 走到这一步再记一笔并落盘:以前日志停在"正在优雅关闭"就没了,
-		// 根本分不清是没走到 exec、还是 exec 失败了。
-		state.Logger.Info("[更新] 准备用新二进制替换进程映像: "+exe, "version")
-		state.Logger.Flush()
-
-		if err := updater.Restart(exe); err != nil {
-			// execve 失败(权限丢了、挂载带 noexec、ETXTBSY…)→ 退回"起个新进程再退出"。
-			// 比直接死掉强得多:用户手上这台正在跑抢购,停机就是错过补货。
-			state.Logger.Error("[更新] 替换进程映像失败: "+err.Error()+"，改用启动新进程的方式", "version")
-			state.Logger.Flush()
-			if serr := updater.Spawn(exe); serr != nil {
-				state.Logger.Error("[更新] 启动新进程也失败了: "+serr.Error()+"。请手动重启程序", "version")
-				state.Logger.Flush()
-				console.Error("restart", "err", err, "spawn", serr)
-				os.Exit(1)
-			}
-			state.Logger.Info("[更新] 新进程已拉起,当前进程退出", "version")
-			state.Logger.Flush()
-			os.Exit(0)
-		}
-	}
-
-	// —— 优雅退出 ——
-	//
-	// Docker 停/重建容器(compose down、compose up -d 拉新镜像、重启策略)发的是
-	// SIGTERM,而 Go 默认收到它就当场终止:defer 不会执行,于是
-	//   - sqliteDB.Close() 不跑
-	//   - Logger 是内存缓冲的,没落盘的那批日志直接丢(排查问题时最需要的恰恰是最后几条)
-	//   - 在途请求被硬切断,包括已经走到结账那几秒的下单
-	// 而"拉新镜像重建"是这个项目最常见的运维动作,不该每次都这么收场。
-	//
-	// 自更新有它自己的收尾路径(gracefulRestart),两者不能同时跑 ——
-	// 靠 restartPending 区分。
-	shutdownDone := make(chan struct{})
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		// Shutdown 会让 Serve 立刻返回,而收尾还在那条 goroutine 里跑。
-		// main 直接返回 = 进程退出,数据库可能还没关完 —— 和不处理信号没区别。
-		if shutdownPending.Load() {
-			select {
-			case <-shutdownDone:
-			case <-time.After(30 * time.Second):
-				console.Warn("shutdown", "err", "收尾超过 30 秒,强制退出")
-			}
-			state.Logger.Flush()
-			os.Exit(0)
-		}
-
-		if restartPending.Load() {
-			return // 自更新已经在收尾,别插一脚
-		}
-		shutdownPending.Store(true)
-		console.Info("shutdown", "signal", sig.String())
-		gracefulShutdown(srv, sqliteDB, state.Logger, console, sig.String(), 15*time.Second)
-		close(shutdownDone)
-	}()
-
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		// 运行期 Serve 异常时后台 worker 已在运行：绝不直接关库，必须经协调器走统一有界排空流程再退出！
 		console.Error("server run", "err", err)
+		if won, deadline := coord.beginShutdown("serve_error", defaultShutdownBudget); won {
+			gracefulShutdownWithCoordinator(coord, srv, sqliteDB, state.Logger, console, "serve_error", deadline)
+		}
+		_ = waitMainLifecycleExit(coord)
 		os.Exit(1)
 	}
 
-	// Serve 返回了。如果是自更新触发的 Shutdown,**绝对不能让 main 返回** ——
-	// main 返回就是进程退出,而 exec 还排在另一个 goroutine 里(它得先等
-	// Shutdown 收尾、再关数据库)。
-	//
-	// 这正是之前"自更新后进程直接没了"的原因:Shutdown 让 Serve 立刻返回,
-	// 主 goroutine 跑完 main 就退出了,gracefulRestart 还卡在 sqliteDB.Close(),
-	// syscall.Exec 从来没执行过。日志上表现为"正在优雅关闭以完成重启"之后再无下文。
-	if restartPending.Load() {
-		// exec 成功 → 进程映像被换掉,下面这行永远等不到;
-		// exec 失败 → gracefulRestart 里自己 os.Exit。
-		// 兜底加个上限:万一两条路都没走通,别让用户对着一个挂死的进程干等。
-		time.Sleep(60 * time.Second)
-		state.Logger.Error("[更新] 等了 60 秒仍未完成重启,放弃并退出。请手动启动程序", "version")
-		state.Logger.Flush()
-		os.Exit(1)
+	// main 是进程唯一退出码所有者：经可测收口函数 waitMainLifecycleExit 等待统一 coord.done 并动态跟随 deadline 更新；
+	// 注意：若退出码非 0（如活跃写库超时跳过关库），直接 os.Exit(code) 不跑外层 defer closeDB，保留“活跃写库超时不并发关库”的安全语义！
+	if code := waitMainLifecycleExit(coord); code != 0 {
+		os.Exit(code)
 	}
 }
 
-// restartPending 标记"这次 Serve 退出是自更新计划内的"。
-var restartPending atomic.Bool
+// waitMainLifecycleExitBeforeSelectHook 仅供单测在构造旧 timer 后、进入 select 前插入屏障，
+// 确定性复现“旧 timer.C 与新 deadlineChanged 同时就绪”的竞态窗口（生产环境为 nil）。
+var waitMainLifecycleExitBeforeSelectHook atomic.Pointer[func(observedGen uint64)]
 
-// gracefulShutdown 退出前的收尾:停止接受新请求 → 等在途请求收尾 → 日志落盘 → 关数据库。
-//
-// 抽成独立函数是为了能测:这里真正要保证的是两件**可观察**的事 ——
-// 缓冲区里的日志写进了文件、数据库正常关闭。这两件在收到 SIGTERM 时
-// 原本一件都不会发生(Go 默认当场终止,defer 不执行)。
-//
-// 顺序不能反:先 Flush 再 Close。日志写的是文件不是库,但把"正在关库"
-// 这句留到关完再刷,万一 Close 卡住,最有用的那条线索就丢了。
-func gracefulShutdown(srv *http.Server, sqlDB io.Closer, lg *logger.Logger, console *slog.Logger, reason string, wait time.Duration) {
-	lg.Info("收到 "+reason+",正在优雅退出", "system")
+// waitMainLifecycleExitOnTimerBeforeRecheckHook 仅供单测在 select 明确选中 timer.C 之后、调用锁内二次复核之前插入屏障，
+// 确保如果删掉锁内复核，测试必然失败（杜绝假绿）。
+var waitMainLifecycleExitOnTimerBeforeRecheckHook atomic.Pointer[func(observedGen uint64)]
 
+// waitMainLifecycleExit 是 main 在 srv.Serve 返回后的统一收尾与兜底等待逻辑（独立抽离便于单测直接覆盖）。
+// 动态监听 coord.deadlineUpdated 并带 deadlineGen 锁内二次复核：
+// 即使旧 timer.C 与新 deadlineChanged 同时就绪且 Go select 选中旧 timer.C，锁内复核发现代次已变或未超新截止点也会重新等待，绝不提前返回 1！
+func waitMainLifecycleExit(coord *shutdownCoordinator) int {
+	const grace = 2 * time.Second
+	for {
+		mode, done, deadline, observedGen, deadlineChanged, _ := coord.stateWithDeadlineSignal()
+		if mode != lifecycleShuttingDown && mode != lifecycleRestarting && mode != lifecycleRestartCommitted && mode != lifecycleRestartAborted {
+			return 0
+		}
+		waitLimit := time.Until(deadline.Add(grace))
+		if waitLimit < 50*time.Millisecond {
+			waitLimit = 50 * time.Millisecond
+		}
+		timer := time.NewTimer(waitLimit)
+		if hook := waitMainLifecycleExitBeforeSelectHook.Load(); hook != nil && *hook != nil {
+			(*hook)(observedGen)
+		}
+		select {
+		case <-done:
+			timer.Stop()
+			_, _, _, exitCode, _ := coord.state()
+			return exitCode
+		case <-deadlineChanged:
+			timer.Stop()
+		case <-timer.C:
+			if hook := waitMainLifecycleExitOnTimerBeforeRecheckHook.Load(); hook != nil && *hook != nil {
+				(*hook)(observedGen)
+			}
+			// 锁内复核：防止旧 timer 与新 deadlineChanged 同时就绪时 Go 随机选到旧 timer.C 误杀有效 SIGTERM 收尾
+			expired, finished, code := coord.isDeadlineStillCurrentAndExpired(observedGen, grace)
+			if finished {
+				return code
+			}
+			if expired {
+				return 1
+			}
+			// 代次已推进或未到期：继续下一轮按新 deadline 等待
+		}
+	}
+}
+
+// startSignalHandler 是 main 的信号接收与退出分发入口（独立抽离便于单测端到端验证信号入口 + 兜底退出）。
+// 关键并发不变量：唯一持有 sigCh 读取权的单协程同时充当重启最终提交的同步裁决器（commitReqCh）。
+// 信号被此协程取出、登记进 coord 与响应重启最终提交请求严格串行执行，数学上彻底消灭“信号已被取走但尚未登记，重启却同时提交”的竞态窗口。
+func startSignalHandler(
+	sigCh <-chan os.Signal,
+	coord *shutdownCoordinator,
+	srv *http.Server,
+	sqlDB io.Closer,
+	lg *logger.Logger,
+	console *slog.Logger,
+	budget time.Duration,
+) <-chan struct{} {
+	type arbiterReply struct {
+		transitioned bool
+		sig          string
+		deadline     time.Time
+	}
+	type arbiterReq struct {
+		target lifecycleMode
+		reply  chan arbiterReply
+	}
+	coord.setShutdownBudget(budget)
+	arbiterReqCh := make(chan arbiterReq)
+	exited := make(chan struct{})
+	coord.setRestartArbiter(func(target lifecycleMode) (bool, string, time.Time) {
+		replyCh := make(chan arbiterReply, 1)
+		select {
+		case arbiterReqCh <- arbiterReq{target: target, reply: replyCh}:
+			rep := <-replyCh
+			return rep.transitioned, rep.sig, rep.deadline
+		case <-exited:
+			return coord.transitionRestartTerminalDirect(target)
+		case <-coord.done:
+			return false, "", time.Time{}
+		}
+	})
+
+	go func() {
+		defer close(exited)
+		defer coord.clearRestartArbiter()
+		for {
+			select {
+			case sig, ok := <-sigCh:
+				if !ok {
+					return
+				}
+				sigName := sig.String()
+				won, deadline := coord.beginShutdown(sigName, budget)
+				if !won {
+					continue
+				}
+				logCtx, cancel := context.WithDeadline(context.Background(), drainDeadlineFrom(deadline))
+				logLifecycleBounded(logCtx, func() {
+					if console != nil {
+						console.Info("shutdown", "signal", sigName)
+					}
+				})
+				cancel()
+				gracefulShutdownWithCoordinator(coord, srv, sqlDB, lg, console, sigName, deadline)
+				return
+			case req := <-arbiterReqCh:
+				// 单协程严格串行裁决（同时覆盖最终重启提交 lifecycleRestartCommitted 与 HTTP 超时中止 lifecycleRestartAborted）：
+				// 先优先非阻塞排空 sigCh（即便 sig 与 req 同刻就绪，也 100% 优先信号），
+				// 绝不存在“信号已被另一协程读出但尚未调用 beginShutdown”的并发窗口！
+				select {
+				case sig, ok := <-sigCh:
+					if ok && sig != nil {
+						_, _ = coord.beginShutdown(sig.String(), budget)
+					}
+				default:
+				}
+				transitioned, sigName, dl := coord.transitionRestartTerminalDirect(req.target)
+				req.reply <- arbiterReply{transitioned: transitioned, sig: sigName, deadline: dl}
+				if transitioned {
+					return
+				}
+			}
+		}
+	}()
+	return exited
+}
+
+// drainDeadlineFrom 依据统一截止时间推导排空阶段截止点，为日志刷盘与 SQLite 关闭预留缓冲。
+func drainDeadlineFrom(deadline time.Time) time.Time {
+	remaining := time.Until(deadline)
+	reserve := persistReserveBudget
+	if remaining <= reserve+500*time.Millisecond {
+		reserve = remaining / 5
+	}
+	return deadline.Add(-reserve)
+}
+
+// logLifecycleBounded 在有界上下文内输出生命周期日志与控制台日志；
+// 单次日志输出再加 50ms 硬顶，防止阻塞的 stdout/stderr 管道吃掉整段排空或信号交接预算。
+func logLifecycleBounded(ctx context.Context, fn func()) {
+	if fn == nil {
+		return
+	}
+	logCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, _ = runBounded(logCtx, func() error {
+		fn()
+		return nil
+	})
+}
+
+// auxStopHooks 仅供单测注入和观测各独立辅助停止项的并发扇出行为（生产环境全部走真实组件函数）。
+type auxStopFns struct {
+	poller  func()
+	monitor func()
+	vps     func(*app.State)
+	prewarm func()
+}
+
+var auxStopOverride atomic.Pointer[auxStopFns]
+
+// auxStopHook 保留给现有测试观测辅助停止触发。
+var auxStopHook atomic.Pointer[func()]
+
+func stopAllBackgroundLoops(ctx context.Context, lg *logger.Logger) bool {
 	// 先停后台循环再关资源:下单/监控的副作用(OVH 侧订单/通知)先于持久化,
 	// 中途被杀 → 重启后重放(重复下单/重复通知)。停循环让它们走到下一个
-	// 安全点(状态已落库)再退出;HTTP 收尾和 DB 关闭紧随其后
-	handlers.StopPoller()
-	if monitorState != nil {
-		monitorState.Stop()
-	}
-	vps.Stop(appStateForShutdown)
-	if appStateForShutdown != nil && appStateForShutdown.OrderPrewarm != nil {
-		appStateForShutdown.OrderPrewarm.Close()
-	}
-	lg.Info("后台循环已停止(TG 轮询/服务器监控/VPS 监控)", "system")
+	// 安全点(状态已落库)再退出;HTTP 收尾和 DB 关闭紧随其后。
+	// 重要：已注册循环与每个同步辅助组件（TG 轮询 / 服务器监控 / VPS 监控 / 预热池）均独立并发派发停止请求，
+	// 并在同一 ctx 下统一等待，彻底避免任一组件阻塞卡住导致其他组件收不到停止请求！
+	ov := auxStopOverride.Load()
+	st := appStateForShutdown.Load()
 
-	// 给在途请求留出收尾时间。抢购链路最长的一步是结账,实测几秒级;
-	// 超时也要继续往下走,不能因为一个卡住的请求把整个退出流程拖死。
-	ctx, cancel := context.WithTimeout(context.Background(), wait)
-	defer cancel()
-	if srv != nil {
-		if err := srv.Shutdown(ctx); err != nil {
-			if console != nil {
-				console.Warn("shutdown", "err", err)
-			}
-			lg.Warn("优雅退出:仍有请求未在期限内收尾,继续关闭 - "+err.Error(), "system")
+	pollerFn := func() { handlers.StopPoller() }
+	monitorFn := func() {
+		if monitorState != nil {
+			monitorState.Stop()
 		}
 	}
-	lg.Info("优雅退出:请求已收尾,正在关闭数据库", "system")
-	lg.Flush()
-	if sqlDB != nil {
-		if err := sqlDB.Close(); err != nil {
-			if console != nil {
-				console.Warn("close sqlite", "err", err)
+	vpsFn := func() { vps.Stop(st) }
+	prewarmFn := func() {
+		if st != nil && st.OrderPrewarm != nil {
+			st.OrderPrewarm.Close()
+		}
+	}
+	if ov != nil {
+		if ov.poller != nil {
+			pollerFn = ov.poller
+		}
+		if ov.monitor != nil {
+			monitorFn = ov.monitor
+		}
+		if ov.vps != nil {
+			vpsFn = func() { ov.vps(st) }
+		}
+		if ov.prewarm != nil {
+			prewarmFn = ov.prewarm
+		}
+	}
+
+	tasks := []func() bool{
+		func() bool { return stopRegisteredBackgroundLoops(ctx, lg) },
+		func() bool { ok, _ := runBounded(ctx, func() error { pollerFn(); return nil }); return ok },
+		func() bool { ok, _ := runBounded(ctx, func() error { monitorFn(); return nil }); return ok },
+		func() bool { ok, _ := runBounded(ctx, func() error { vpsFn(); return nil }); return ok },
+		func() bool { ok, _ := runBounded(ctx, func() error { prewarmFn(); return nil }); return ok },
+	}
+	if hook := auxStopHook.Load(); hook != nil && *hook != nil {
+		h := *hook
+		tasks = append(tasks, func() bool { ok, _ := runBounded(ctx, func() error { h(); return nil }); return ok })
+	}
+
+	var (
+		wg       sync.WaitGroup
+		allClean atomic.Bool
+	)
+	allClean.Store(true)
+	wg.Add(len(tasks))
+	for _, fn := range tasks {
+		fn := fn
+		go func() {
+			defer wg.Done()
+			if !fn() {
+				allClean.Store(false)
 			}
-			lg.Error("关闭数据库失败: "+err.Error(), "system")
-			lg.Flush()
+		}()
+	}
+	wg.Wait()
+
+	clean := allClean.Load()
+	if lg != nil {
+		logLifecycleBounded(ctx, func() {
+			if clean {
+				lg.Info("后台循环已停止(抢购队列/订单状态/区域预热/更新检查/TG 轮询/服务器监控/VPS 监控)", "system")
+			} else {
+				lg.Warn("优雅退出:部分后台循环或监听未在期限内完全结束", "system")
+			}
+		})
+	}
+	return clean
+}
+
+// gracefulShutdown 保留单测兼容入口，委托给统一协调器与统一截止时间实现。
+func gracefulShutdown(srv *http.Server, sqlDB io.Closer, lg *logger.Logger, console *slog.Logger, reason string, wait time.Duration) {
+	coord := newShutdownCoordinator()
+	_, deadline := coord.beginShutdown(reason, wait)
+	gracefulShutdownWithCoordinator(coord, srv, sqlDB, lg, console, reason, deadline)
+}
+
+func gracefulShutdownWithCoordinator(
+	coord *shutdownCoordinator,
+	srv *http.Server,
+	sqlDB io.Closer,
+	lg *logger.Logger,
+	console *slog.Logger,
+	reason string,
+	deadline time.Time,
+) {
+	exitCode := 0
+	defer func() { coord.finish(exitCode) }()
+
+	// 从收到信号起共享统一绝对截止时间：后台循环、在途写请求与 HTTP 并发排空，预留缓冲给刷盘与关库。
+	drainCtx, drainCancel := context.WithDeadline(context.Background(), drainDeadlineFrom(deadline))
+	defer drainCancel()
+
+	if lg != nil {
+		logLifecycleBounded(drainCtx, func() {
+			lg.Info("收到 "+reason+",正在优雅退出", "system")
+		})
+	}
+
+	// 阶段 0：若主协程正处于后台组件启动阶段（beginStartupPhase .. finishStartupPhase），先等待其完成启动登记再统一执行 Stop，
+	// 杜绝“Stop 先跑完、主协程随后又调用 mon.Start / vps.Start / StartPollerIfEnabled”的乱序启动窗口！
+	startupClean := coord.waitStartupPhaseDone(drainCtx)
+
+	// 阶段 1：并发排空在途写请求 + HTTP 服务 + 第一轮后台循环停止（尽早取消在途轮询/抢购任务）。
+	// 关键正确性保护：已通过写门禁的在途写请求（如 POST /monitor/start、/vps-monitor/start）
+	// 仍可能在第一轮 stopAllBackgroundLoops 返回后才刚刚拉起监控，因此在所有写请求彻底排空后，
+	// 必须再次兜底执行一次 stopAllBackgroundLoops 确保关库瞬间无任何刚被重启的后台组件仍在写库！
+	var (
+		wg          sync.WaitGroup
+		bgClean     bool
+		writesClean bool
+		httpErr     error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bgClean = startupClean && stopAllBackgroundLoops(drainCtx, lg)
+	}()
+	go func() {
+		defer wg.Done()
+		writesClean = coord.waitWritesDrained(drainCtx)
+	}()
+	if srv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			httpErr = srv.Shutdown(drainCtx)
+		}()
+	}
+	wg.Wait()
+	// 写请求已全部排空且新写已被 writeGateMiddleware 永久拒绝后，做最终一次后台停止收口，确保无任何被在途写请求重新拉起的组件
+	if writesClean && bgClean {
+		bgClean = stopAllBackgroundLoops(drainCtx, lg)
+	}
+
+	// 收尾持久化、日志输出与关库全部受剩余统一 deadline 约束，确保阻塞写入器、阻塞控制台或慢 Close 不会无限挂死进程。
+	finalCtx, finalCancel := context.WithDeadline(context.Background(), deadline)
+	defer finalCancel()
+
+	if httpErr != nil {
+		logLifecycleBounded(finalCtx, func() {
+			if console != nil {
+				console.Warn("shutdown", "err", httpErr)
+			}
+			if lg != nil {
+				lg.Warn("优雅退出:仍有请求未在期限内收尾 - "+httpErr.Error(), "system")
+			}
+		})
+	}
+	if !writesClean && console != nil {
+		logLifecycleBounded(finalCtx, func() {
+			console.Warn("shutdown", "err", "仍有在途写请求未在排空截止前结束")
+		})
+	}
+	if !bgClean && console != nil {
+		logLifecycleBounded(finalCtx, func() {
+			console.Warn("shutdown", "err", "仍有后台循环未在排空截止前结束")
+		})
+	}
+
+	drainClean := bgClean && writesClean && httpErr == nil
+	if !drainClean {
+		// 排空未完全收尾时，在途结账或 HTTP handler 仍可能持有/写入数据库，
+		// 此时跳过显式 sqlDB.Close 以避免在活跃操作下破坏 DB 句柄，并明确以非零码在预算内退出。
+		exitCode = 1
+		if lg != nil {
+			logLifecycleBounded(finalCtx, func() {
+				lg.Error("优雅退出:排空超时，跳过显式关闭数据库并以非零码退出", "system")
+			})
+			if ok, err := runBounded(finalCtx, func() error { return lg.CloseWithErr() }); (!ok || err != nil) && console != nil {
+				logLifecycleBounded(finalCtx, func() {
+					console.Error("close logger on dirty shutdown", "completed", ok, "err", err)
+				})
+			}
+		}
+		return
+	}
+
+	// 统一在最终收尾窗口内提前切分预算：
+	// - 为日志落盘/超时错误记录预留 logReserve（deadline 之前），
+	// - 前置 Flush、补救 SaveQueue 均严格继承 finalCtx 且绝不晚于 workDeadline = deadline - logReserve，
+	//   前置 Flush 与其超时告警均严格限制在 workDeadline 前半段，无论预算长短绝不挤占补救 SaveQueue 的执行窗口。
+	rem := time.Until(deadline)
+	logReserve := 150 * time.Millisecond
+	if rem/4 < logReserve {
+		logReserve = rem / 4
+	}
+	if logReserve < 30*time.Millisecond && rem > 60*time.Millisecond {
+		logReserve = 30 * time.Millisecond
+	}
+	workDeadline := deadline.Add(-logReserve)
+	if !workDeadline.After(time.Now()) {
+		workDeadline = deadline
+	}
+
+	preFlushTimedOut := false
+	if lg != nil {
+		// 只要还有剩余工作窗口，就至多把一半交给前置 Flush，严格为后续补救 SaveQueue 留出另一半预算（短预算同样按比例切分）
+		flushDeadline := workDeadline
+		if remWork := time.Until(workDeadline); remWork > 0 {
+			flushDeadline = time.Now().Add(remWork / 2)
+		}
+		flushCtx, flushCancel := context.WithDeadline(finalCtx, flushDeadline)
+		logLifecycleBounded(flushCtx, func() {
+			lg.Info("优雅退出:请求已收尾,正在关闭数据库", "system")
+		})
+		if ok, _ := runBounded(flushCtx, func() error { lg.Flush(); return nil }); !ok {
+			preFlushTimedOut = true
+		}
+		flushCancel()
+	}
+
+	// 排空完成后、关库前：若仍有未成功持久化的关键队列状态（例如 worker 三次重试均失败），
+	// 在继承自 finalCtx 且不晚于 workDeadline 的子上下文内执行一次补救保存：
+	// - 绝对不会突破总截止时间 deadline（父 ctx 为 finalCtx）；
+	// - 若补救保存超时未返回（!saveOK），保存协程仍可能在执行 ReplaceQueue，此时严禁并发关库，
+	//   直接跳过 sqlDB.Close、用尚在预算内的 finalCtx 写出明确 ERROR 日志，并以非零码退出。
+	saveInFlightTimedOut := false
+	if st := appStateForShutdown.Load(); st != nil && st.HasPendingCriticalQueueSave() {
+		saveCtx, saveCancel := context.WithDeadline(finalCtx, workDeadline)
+		saveOK, saveErr := runBounded(saveCtx, func() error {
+			return st.SaveQueue()
+		})
+		saveCancel()
+		if !saveOK {
+			saveInFlightTimedOut = true
+			exitCode = 1
+			logLifecycleBounded(finalCtx, func() {
+				if console != nil {
+					console.Error("shutdown critical queue save timed out; skipping DB close", "err", saveErr)
+				}
+				if lg != nil {
+					lg.Error("优雅退出:关键订单队列补救保存超时，为避免并发破坏活跃写库跳过显式关闭数据库并以非零码退出", "system")
+				}
+			})
+		} else if saveErr != nil || st.HasPendingCriticalQueueSave() {
+			exitCode = 1
+			logLifecycleBounded(finalCtx, func() {
+				if console != nil {
+					console.Error("shutdown critical queue save failed", "err", saveErr)
+				}
+				if lg != nil {
+					lg.Error(fmt.Sprintf("优雅退出:关键订单队列状态仍有未落库代次(err=%v)，将以非零码退出", saveErr), "system")
+				}
+			})
+		}
+	}
+	if preFlushTimedOut && console != nil {
+		// 前置 Flush 的告警放到补救 SaveQueue 之后再用 finalCtx 记录，绝不让慢控制台挤占补救保存窗口
+		logLifecycleBounded(finalCtx, func() {
+			console.Warn("shutdown", "err", "关库前日志刷盘超过子预算")
+		})
+	}
+	if sqlDB != nil && !saveInFlightTimedOut {
+		ok, err := runBounded(finalCtx, func() error {
+			_, cerr := coord.closeDB(sqlDB)
+			return cerr
+		})
+		if !ok || err != nil {
+			exitCode = 1
+			logLifecycleBounded(finalCtx, func() {
+				if console != nil {
+					console.Error("close sqlite failed or timed out", "completed", ok, "err", err)
+				}
+				if lg != nil && err != nil {
+					lg.Error("关闭数据库失败: "+err.Error(), "system")
+				}
+			})
+		}
+	}
+	if lg != nil {
+		// finalCtx 已耗尽时（如 sqlDB.Close 刚刚超期），无需再启动必然立刻超时的 CloseWithErr 孤儿协程
+		if finalCtx.Err() != nil {
+			exitCode = 1
+		} else {
+			ok, err := runBounded(finalCtx, func() error { return lg.CloseWithErr() })
+			if !ok || err != nil {
+				exitCode = 1
+				if console != nil {
+					logLifecycleBounded(finalCtx, func() {
+						console.Error("close logger failed or timed out", "completed", ok, "err", err)
+					})
+				}
+			}
 		}
 	}
 }
 
-// shutdownPending 标记"这次 Serve 退出是收到退出信号后计划内的"。
-// 和 restartPending 分开:两条路径的收尾动作不同(一个要 exec,一个要退出),
-// 共用一个标记会让自更新在收到 SIGTERM 时走错分支。
-var shutdownPending atomic.Bool
+// hasPendingCriticalQueueSave 检查全局运行态是否存在尚未被 SaveQueue 覆盖的关键队列状态。
+func hasPendingCriticalQueueSave() bool {
+	st := appStateForShutdown.Load()
+	return st != nil && st.HasPendingCriticalQueueSave()
+}
+
+// restartHTTPTimeoutBranchHook 仅供单测精确验证本次调用确实走入了 httpErr != nil 后的原子裁决分支（生产环境为 nil）。
+var restartHTTPTimeoutBranchHook atomic.Pointer[func(handedOffToSigterm bool)]
+
+// executeGracefulRestart 执行受控自更新重启，返回 (exitCode, completedRestart)。
+//  1. 进入 lifecycleRestarting 立即经 writeGateMiddleware 拒绝一切新写操作；
+//  2. 并发等待后台循环 + 在途写请求全部干净收尾，并检查是否存在任何未落库的关键队列代次（含触发重启前遗留的失败）；
+//  3. 所有生命周期日志与控制台输出均纳入有界截止时间，绝不因阻塞日志或 stdout 卡死状态机或截断延迟 SIGTERM 交接；
+//  4. 若任一排空超时或存在未落库关键代次，先完成维护态/延迟 SIGTERM 原子状态切换，绝不关库、绝不替换进程；
+//  5. 全部干净后，等待 srv.Shutdown 无错完成、在剩余预算内关库并落盘日志，全部成功后才调用 exec/spawn。
+func executeGracefulRestart(
+	coord *shutdownCoordinator,
+	srv *http.Server,
+	sqlDB io.Closer,
+	lg *logger.Logger,
+	console *slog.Logger,
+	exe string,
+	budget time.Duration,
+	restartFn func(string) error,
+	spawnFn func(string) error,
+) (exitCode int, completedRestart bool) {
+	won, deadline := coord.beginRestart(budget)
+	if !won {
+		if lg != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			logLifecycleBounded(ctx, func() {
+				lg.Warn("[更新] 已有退出、维护或重启流程进行中，忽略本次自更新重启", "version")
+			})
+			cancel()
+		}
+		return 0, false
+	}
+
+	bgDeadline := deadline.Add(-8 * time.Second)
+	if !bgDeadline.After(time.Now()) {
+		bgDeadline = drainDeadlineFrom(deadline)
+	}
+	bgCtx, bgCancel := context.WithDeadline(context.Background(), bgDeadline)
+
+	if lg != nil {
+		logLifecycleBounded(bgCtx, func() {
+			lg.Info("[更新] 正在优雅关闭以完成重启（已停止接纳新写操作）", "version")
+		})
+	}
+
+	var (
+		wg          sync.WaitGroup
+		bgClean     bool
+		writesClean bool
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bgClean = stopAllBackgroundLoops(bgCtx, lg)
+	}()
+	go func() {
+		defer wg.Done()
+		writesClean = coord.waitWritesDrained(bgCtx)
+	}()
+	wg.Wait()
+	// 所有在途写请求排空且新写已被拒绝后，再次执行一次后台停止收口，彻底堵住“已放行写请求在首轮停后台之后重新 Start 监控”的窗口
+	if writesClean && bgClean {
+		bgClean = stopAllBackgroundLoops(bgCtx, lg)
+	}
+	bgCancel()
+
+	flushBounded := func(ctx context.Context) (bool, error) {
+		if lg == nil {
+			return true, nil
+		}
+		return runBounded(ctx, func() error { lg.Flush(); return nil })
+	}
+
+	abortToMaintenance := func(reason string) {
+		// 先完成可观测状态与维护态/延迟信号交接，绝不在状态迁移前同步调用可能阻塞的日志/控制台 I/O
+		handlers.SetUpdateFailed(reason)
+		deferredSig, sigDeadline := coord.enterMaintenance(reason)
+		if deferredSig != "" {
+			sigCtx, sigCancel := context.WithDeadline(context.Background(), sigDeadline)
+			logLifecycleBounded(sigCtx, func() {
+				if lg != nil {
+					lg.Error("[更新] "+reason, "version")
+				}
+				if console != nil {
+					console.Error("restart aborted; handing off deferred signal", "signal", deferredSig, "reason", reason)
+				}
+			})
+			sigCancel()
+			gracefulShutdownWithCoordinator(coord, srv, sqlDB, lg, console, deferredSig, sigDeadline)
+			return
+		}
+		flushCtx, flushCancel := context.WithDeadline(context.Background(), deadline)
+		logLifecycleBounded(flushCtx, func() {
+			if lg != nil {
+				lg.Error("[更新] "+reason, "version")
+			}
+			if console != nil {
+				console.Error("restart aborted; entered maintenance mode", "reason", reason)
+			}
+		})
+		_, _ = flushBounded(flushCtx)
+		flushCancel()
+	}
+
+	// 排空超时分支优先直接交接维护态/延迟 SIGTERM，不额外触碰可能被占用的 QueueMu；
+	// 仅在排空已干净完成时，再检查是否存在尚未持久化的关键队列代次。
+	if !bgClean || !writesClean {
+		abortToMaintenance("后台任务或在途写请求未在期限内安全收尾，已中止自动重启并进入维护模式（已拒绝新写操作，不关闭数据库）；请核对订单状态后手动重启")
+		return 0, false
+	}
+	if hasPendingCriticalQueueSave() {
+		abortToMaintenance("检测到存在未成功持久化的关键订单队列状态，已中止自动重启并进入维护模式；请核对 OVH 订单后手动重启")
+		return 0, false
+	}
+
+	// 进入不可逆关 HTTP / 关库 / 替换进程映像前，若等待期间已登记 SIGTERM/SIGINT，
+	// 优先遵循运维停机信号（避免容器/systemd 正在停止服务时被自更新 exec 强行拉起新进程）。
+	if deferredSig, sigDeadline := coord.takeDeferredShutdown(); deferredSig != "" {
+		handlers.SetUpdateFailed("等待重启排空期间收到停机信号(" + deferredSig + ")，已取消替换进程并转入优雅停机")
+		sigCtx, sigCancel := context.WithDeadline(context.Background(), sigDeadline)
+		logLifecycleBounded(sigCtx, func() {
+			if lg != nil {
+				lg.Info("[更新] 重启排空期间收到停机信号("+deferredSig+")，放弃替换进程映像并执行优雅退出", "version")
+			}
+			if console != nil {
+				console.Info("restart superseded by deferred shutdown signal", "signal", deferredSig)
+			}
+		})
+		sigCancel()
+		gracefulShutdownWithCoordinator(coord, srv, sqlDB, lg, console, deferredSig, sigDeadline)
+		_, _, _, code, _ := coord.state()
+		return code, false
+	}
+
+	httpCtx, httpCancel := context.WithDeadline(context.Background(), drainDeadlineFrom(deadline))
+	var httpErr error
+	if srv != nil {
+		httpErr = srv.Shutdown(httpCtx)
+	}
+	httpCancel()
+	finalCtx, finalCancel := context.WithDeadline(context.Background(), deadline)
+	defer finalCancel()
+
+	if httpErr != nil {
+		// 锁内原子裁决：“接管延迟 SIGTERM/SIGINT” 或 “锁定终态中止 lifecycleRestartAborted” 二选一，
+		// 彻底封死检查延迟信号之后、日志/finish(1) 之前登记信号被吞掉的竞态窗口！
+		_, deferredSig, sigDeadline := coord.abortRestartOrTakeDeferredShutdown()
+		if deferredSig != "" {
+			if h := restartHTTPTimeoutBranchHook.Load(); h != nil && *h != nil {
+				(*h)(true)
+			}
+			handlers.SetUpdateFailed("HTTP 排空期间收到停机信号(" + deferredSig + ")，已转入优雅停机并继续排空在途请求")
+			gracefulShutdownWithCoordinator(coord, srv, sqlDB, lg, console, deferredSig, sigDeadline)
+			_, _, _, code, _ := coord.state()
+			return code, false
+		}
+		if h := restartHTTPTimeoutBranchHook.Load(); h != nil && *h != nil {
+			(*h)(false)
+		}
+		// HTTP 排空超时且已锁定终态中止（后续不再接受延迟信号登记）：仍有请求在执行，绝不关库或替换进程映像
+		reason := "HTTP 在途请求未在期限内排空(" + httpErr.Error() + ")，已中止自动重启且未关闭数据库，请核对后手动重启"
+		handlers.SetUpdateFailed(reason)
+		logLifecycleBounded(finalCtx, func() {
+			if lg != nil {
+				lg.Error("[更新] "+reason, "version")
+			}
+			if console != nil {
+				console.Error("restart aborted: http shutdown timed out", "err", httpErr)
+			}
+		})
+		_, _ = flushBounded(finalCtx)
+		coord.finish(1)
+		return 1, false
+	}
+
+	// 再次在关库/替换进程前检查一次延迟停机信号（覆盖 srv.Shutdown 期间到达的 SIGTERM）
+	if deferredSig, sigDeadline := coord.takeDeferredShutdown(); deferredSig != "" {
+		handlers.SetUpdateFailed("HTTP 排空期间收到停机信号(" + deferredSig + ")，已取消替换进程并转入优雅停机")
+		gracefulShutdownWithCoordinator(coord, nil, sqlDB, lg, console, deferredSig, sigDeadline)
+		_, _, _, code, _ := coord.state()
+		return code, false
+	}
+
+	if sqlDB != nil {
+		ok, err := runBounded(finalCtx, func() error {
+			_, cerr := coord.closeDB(sqlDB)
+			return cerr
+		})
+		if !ok || err != nil {
+			// 关库失败或超时前，先做终态裁决：锁死后续延迟信号登记并消费窗口内可能已登记的 SIGTERM，
+			// 同时保留原始失败退出码 1 且绝不重复关闭仍在关/已失败的数据库句柄！
+			_, deferredSig, _ := coord.abortRestartOrTakeDeferredShutdown()
+			reason := fmt.Sprintf("关闭数据库失败或超时(completed=%v err=%v)，已中止替换进程映像", ok, err)
+			if deferredSig != "" {
+				reason += "；期间收到停机信号(" + deferredSig + ")，已跳过重复关库并以非零码结束"
+			}
+			handlers.SetUpdateFailed(reason)
+			logLifecycleBounded(finalCtx, func() {
+				if lg != nil {
+					lg.Error("[更新] "+reason, "version")
+				}
+				if console != nil {
+					console.Error("restart aborted: close sqlite failed", "completed", ok, "err", err, "deferredSignal", deferredSig)
+				}
+			})
+			if lg != nil && finalCtx.Err() == nil {
+				_, _ = runBounded(finalCtx, func() error { return lg.CloseWithErr() })
+			}
+			coord.finish(1)
+			return 1, false
+		}
+	}
+
+	if lg != nil {
+		logLifecycleBounded(finalCtx, func() {
+			lg.Info("[更新] 准备用新二进制替换进程映像: "+exe, "version")
+		})
+		ok, err := runBounded(finalCtx, func() error { return lg.CloseWithErr() })
+		if !ok || err != nil {
+			// 关日志失败或超时前，先做终态裁决：消费窗口内可能已登记的 SIGTERM 并锁死后续登记，
+			// 保留原始失败退出码 1 且绝不重复关闭已关的 DB 或仍在关的 logger！
+			_, deferredSig, _ := coord.abortRestartOrTakeDeferredShutdown()
+			reason := fmt.Sprintf("最终日志落盘失败或超过统一截止时间(completed=%v err=%v)，已中止替换进程映像", ok, err)
+			if deferredSig != "" {
+				reason += "；期间收到停机信号(" + deferredSig + ")，已跳过重复收尾并以非零码结束"
+			}
+			handlers.SetUpdateFailed(reason)
+			if console != nil {
+				logLifecycleBounded(finalCtx, func() {
+					console.Error("restart aborted: logger close failed or timed out", "completed", ok, "err", err, "deferredSignal", deferredSig)
+				})
+			}
+			coord.finish(1)
+			return 1, false
+		}
+	}
+
+	// 最终原子提交点：与 beginShutdown 共用同一把锁检查关库/关日志窗口内是否登记了 SIGTERM/SIGINT。
+	// 若已登记，绝不执行 restartFn/spawnFn，直接在 DB/日志均已关闭的状态下完成收口并返回退出码 0；
+	// 否则原子切换为 lifecycleRestartCommitted，封死一切后续延迟信号窗口后立即执行进程替换。
+	committed, deferredSig, _ := coord.commitRestartOrTakeDeferredShutdown()
+	if !committed {
+		if deferredSig != "" {
+			handlers.SetUpdateFailed("关库/收尾期间收到停机信号(" + deferredSig + ")，已取消替换进程并完成优雅停机")
+			if console != nil {
+				logLifecycleBounded(finalCtx, func() {
+					console.Info("restart superseded by deferred shutdown signal before exec", "signal", deferredSig)
+				})
+			}
+		}
+		coord.finish(0)
+		return 0, false
+	}
+
+	if err := restartFn(exe); err != nil {
+		logLifecycleBounded(finalCtx, func() {
+			if lg != nil {
+				lg.Error("[更新] 替换进程映像失败: "+err.Error()+"，改用启动新进程的方式", "version")
+			}
+		})
+		_, _ = flushBounded(finalCtx)
+		if serr := spawnFn(exe); serr != nil {
+			logLifecycleBounded(finalCtx, func() {
+				if lg != nil {
+					lg.Error("[更新] 启动新进程也失败了: "+serr.Error()+"。请手动重启程序", "version")
+				}
+				if console != nil {
+					console.Error("restart", "err", err, "spawn", serr)
+				}
+			})
+			_, _ = flushBounded(finalCtx)
+			coord.finish(1)
+			return 1, false
+		}
+		logLifecycleBounded(finalCtx, func() {
+			if lg != nil {
+				lg.Info("[更新] 新进程已拉起,当前进程退出", "version")
+			}
+		})
+		_, _ = flushBounded(finalCtx)
+		coord.finish(0)
+		return 0, true
+	}
+	coord.finish(0)
+	return 0, true
+}
 
 // listenWithRetry 绑端口,短暂重试。
 //
@@ -884,7 +2133,13 @@ func mountEmbeddedUI(r *gin.Engine) {
 	if !hasUI() {
 		return
 	}
-	distFS := webDistFS()
+	registerEmbeddedUI(r, webDistFS())
+}
+
+func registerEmbeddedUI(r *gin.Engine, distFS fs.FS) {
+	if distFS == nil {
+		return
+	}
 	indexHTML, err := fs.ReadFile(distFS, "index.html")
 	if err != nil {
 		// 没构出 index.html，等于没 UI；退化为纯 API
@@ -905,15 +2160,25 @@ func mountEmbeddedUI(r *gin.Engine) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
-		clean := strings.TrimPrefix(reqPath, "/")
+		clean := strings.TrimPrefix(path.Clean("/"+reqPath), "/")
 		// 根路径或显式访问 index.html：直接写 index.html，绕开 FileServer 的 301 重定向
 		if clean == "" || clean == "index.html" {
 			serveIndex(c)
 			return
 		}
-		// 命中具体文件 → FileServer 处理（带正确 Content-Type + 缓存语义）
+		// 命中具体文件 → FileServer 处理；/assets/* 为 Vite 带内容哈希的构建产物，赋予长缓存
 		if info, err := fs.Stat(distFS, clean); err == nil && !info.IsDir() {
+			if strings.HasPrefix(clean, "assets/") {
+				c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			fileServer.ServeHTTP(c.Writer, c.Request)
+			return
+		}
+		// 缺失的 /assets/ 目录、/assets/* 或显式带扩展名的静态资源路径必须返回 404，
+		// 绝不能回落为 200 text/html（否则发版后旧 chunk 请求会拿到 HTML 并可能被 CDN 缓存）。
+		if clean == "assets" || strings.HasPrefix(clean, "assets/") || path.Ext(clean) != "" {
+			c.Header("Cache-Control", "no-store")
+			c.String(http.StatusNotFound, "404 page not found")
 			return
 		}
 		// SPA 客户端路由：写 index.html，让前端 router 接管

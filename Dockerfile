@@ -41,7 +41,7 @@ ARG TARGETOS
 ARG TARGETARCH
 # CGO_ENABLED=0：纯 Go SQLite，静态链接，交叉编译不需要 gcc
 # -tags ui：触发 //go:embed，把前端打进二进制
-# 版本号注入的路径必须和 build.sh 一致，否则自更新会拿 "dev" 去比较版本
+# 版本号注入的路径必须和 release.yml 一致，否则自更新会拿 "dev" 去比较版本
 RUN VERSION="$(cat /app/VERSION)" && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -tags ui -trimpath \
@@ -49,7 +49,7 @@ RUN VERSION="$(cat /app/VERSION)" && \
       -o /out/ovh-server .
 
 # ---- 4. 运行时 ----
-FROM alpine:3.20
+FROM alpine:3.23
 
 # ca-certificates：要访问 OVH / Telegram / GitHub 的 HTTPS
 # tzdata：日志和「检测时间」用的是本地时区，没有它容器里全是 UTC

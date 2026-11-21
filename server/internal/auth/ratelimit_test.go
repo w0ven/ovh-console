@@ -123,3 +123,31 @@ func TestWhitelistUnaffected(t *testing.T) {
 		t.Errorf("白名单路径被限流误伤了,实际 %d", w.Code)
 	}
 }
+
+func TestTrackedIPsHardCapEvictsOldest(t *testing.T) {
+	ResetAuthFailures()
+	t.Cleanup(ResetAuthFailures)
+
+	base := time.Now()
+	total := maxTrackedIPs + 50
+	for i := 0; i < total; i++ {
+		ip := "2001:db8::" + strconv.FormatInt(int64(i), 16)
+		recordAuthFailure(ip, base.Add(time.Duration(i)*time.Millisecond))
+	}
+
+	failMu.Lock()
+	gotLen := len(failByIP)
+	_, oldestStillPresent := failByIP["2001:db8::0"]
+	_, newestPresent := failByIP["2001:db8::"+strconv.FormatInt(int64(total-1), 16)]
+	failMu.Unlock()
+
+	if gotLen > maxTrackedIPs {
+		t.Fatalf("failByIP grew past maxTrackedIPs: got %d, cap %d", gotLen, maxTrackedIPs)
+	}
+	if oldestStillPresent {
+		t.Error("expected oldest IP bucket to be evicted when cap exceeded")
+	}
+	if !newestPresent {
+		t.Error("expected newest IP bucket to remain tracked")
+	}
+}

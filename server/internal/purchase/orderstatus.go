@@ -1,6 +1,7 @@
 package purchase
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -41,8 +42,13 @@ const orderStatusMaxAge = 30 * 24 * time.Hour
 
 // FetchOrderStatus 读一次订单状态。响应体就是一个 JSON 字符串。
 func FetchOrderStatus(client *ovhsdk.Client, orderID string) (string, error) {
+	return FetchOrderStatusWithContext(context.Background(), client, orderID)
+}
+
+// FetchOrderStatusWithContext 支持 ctx 取消的订单状态查询。
+func FetchOrderStatusWithContext(ctx context.Context, client *ovhsdk.Client, orderID string) (string, error) {
 	var status string
-	if err := client.Get("/me/order/"+orderID+"/status", &status); err != nil {
+	if err := client.GetWithContext(ctx, "/me/order/"+orderID+"/status", &status); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(status), nil
@@ -51,6 +57,14 @@ func FetchOrderStatus(client *ovhsdk.Client, orderID string) (string, error) {
 // RefreshOrderStatuses 把所有还没到终态的成功订单刷一遍状态。
 // force=true 忽略节流(手动刷新用),返回更新了几条。
 func RefreshOrderStatuses(state *app.State, force bool) int {
+	return RefreshOrderStatusesWithContext(context.Background(), state, force)
+}
+
+// RefreshOrderStatusesWithContext 支持通过 ctx 中止在途遍历与上游查询。
+func RefreshOrderStatusesWithContext(ctx context.Context, state *app.State, force bool) int {
+	if ctx.Err() != nil {
+		return 0
+	}
 	// 先拍快照,网络请求不能拿着 HistoryMu
 	state.HistoryMu.Lock()
 	type target struct {
@@ -72,6 +86,9 @@ func RefreshOrderStatuses(state *app.State, force bool) int {
 	now := time.Now()
 	updated := 0
 	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
 		// 这两处以前用 time.Parse(time.RFC3339, ...) 解 NowISO 写出来的时间戳,
 		// 而 NowISO 不带时区 → 每次都解析失败 → `err == nil &&` 短路 → 两个节流
 		// 全是死代码:30 天上限没生效,2 分钟最小间隔也没生效,
@@ -89,8 +106,11 @@ func RefreshOrderStatuses(state *app.State, force bool) int {
 			// 账户删了 —— 这单的状态永远查不到了,不用每轮都报
 			continue
 		}
-		status, err := FetchOrderStatus(client, t.orderID)
+		status, err := FetchOrderStatusWithContext(ctx, client, t.orderID)
 		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
 			state.Logger.Warn(fmt.Sprintf("查询订单 %s 状态失败: %s", t.orderID, err.Error()), "purchase")
 			continue
 		}
@@ -99,7 +119,10 @@ func RefreshOrderStatuses(state *app.State, force bool) int {
 		}
 	}
 	if updated > 0 {
-		go state.SaveHistory()
+		// 同步持久化，避免退出前留下未受控的野 goroutine 写入即将关闭的 SQLite，失败必须记录告警
+		if err := state.SaveHistory(); err != nil && state.Logger != nil {
+			state.Logger.Error("保存订单状态历史失败: "+err.Error(), "purchase")
+		}
 	}
 	return updated
 }
@@ -128,12 +151,33 @@ func applyOrderStatus(state *app.State, entryID, status string) bool {
 // OrderStatusLoop 后台定时刷新。用户付款发生在下单之后的任意时刻,
 // 只在下单那一刻查一次是不够的。
 func OrderStatusLoop(state *app.State) {
+	OrderStatusLoopWithContext(context.Background(), state)
+}
+
+// OrderStatusLoopWithContext 支持通过 ctx 取消的订单状态后台刷新循环。
+func OrderStatusLoopWithContext(ctx context.Context, state *app.State) {
 	// 启动先等一会,别和开机时的一堆 OVH 请求挤在一起
-	time.Sleep(90 * time.Second)
+	timer := time.NewTimer(90 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
 	for {
-		if n := RefreshOrderStatuses(state, false); n > 0 {
+		if ctx.Err() != nil {
+			return
+		}
+		if n := RefreshOrderStatusesWithContext(ctx, state, false); n > 0 {
 			state.Logger.Info(fmt.Sprintf("后台刷新订单状态:%d 条有变化", n), "purchase")
 		}
-		time.Sleep(10 * time.Minute)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }

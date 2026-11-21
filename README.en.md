@@ -4,7 +4,7 @@
 
 **Self-Hosted Stock Monitor, Automated Ordering & Lifecycle Management Console for OVHcloud**
 
-[![Version](https://img.shields.io/badge/version-v0.4.37-2563EB?style=for-the-badge)](https://github.com/w0ven/ovh-console/releases)
+[![Version](https://img.shields.io/badge/version-v0.4.38-2563EB?style=for-the-badge)](https://github.com/w0ven/ovh-console/releases)
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=111827)](https://react.dev/)
 [![Docker](https://img.shields.io/badge/Docker-linux%2Famd64%20%7C%20arm64-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/w0ven/ovh-console/pkgs/container/ovh-console)
@@ -202,7 +202,7 @@ See [`.env.example`](.env.example) for the complete template:
 │       ├── updater/        # Release check & standalone binary self-updater
 │       └── vps/            # VPS live catalog & restock monitor
 ├── web/                    # React + TypeScript frontend
-├── Dockerfile              # Multi-stage build (Node 22 + Go 1.27 + Alpine 3.20)
+├── Dockerfile              # Multi-stage build (Node 22 + Go 1.27 + Alpine 3.23)
 ├── docker-compose.yml      # Production Compose file with log rotation
 └── VERSION                 # Application version
 ```

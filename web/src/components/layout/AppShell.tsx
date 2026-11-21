@@ -9,7 +9,8 @@ import { NAV_GROUPS } from "@/components/layout/nav";
 import { AccountSwitcher } from "@/components/layout/AccountSwitcher";
 import { ThemeToggle } from "@/components/layout/ThemeToggle";
 import { LanguageToggle } from "@/components/layout/LanguageToggle";
-import { useAppVersion } from "@/hooks/use-system-metrics";
+import { VersionUpdateTrigger } from "@/components/common/VersionUpdateTrigger";
+import { useAppVersion, useUpdateCheck } from "@/hooks/use-system-metrics";
 
 /**
  * 珍珠玻璃外壳(来自 scaffold-master 的布局体系):
@@ -65,6 +66,7 @@ export function AppShell() {
   const thumbRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const { data: version } = useAppVersion();
+  const { data: updateCheck } = useUpdateCheck();
 
   const isActive = (to: string) => (to === "/" ? pathname === "/" : pathname.startsWith(to));
 
@@ -190,10 +192,27 @@ export function AppShell() {
               <span className="nav-label">{t("shell.repo")}</span>
               {!collapsed && version && (
                 <span
-                  className="tnum"
-                  style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-faint)", fontWeight: 500 }}
+                  className="tnum inline-flex items-center gap-1"
+                  style={{
+                    marginLeft: "auto",
+                    fontSize: 11,
+                    color: updateCheck?.hasUpdate ? "#d97706" : "var(--ink-faint)",
+                    fontWeight: updateCheck?.hasUpdate ? 600 : 500,
+                  }}
                 >
                   v{version}
+                  {updateCheck?.hasUpdate && (
+                    <span
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: "999px",
+                        background: "#d97706",
+                        display: "inline-block",
+                      }}
+                      aria-hidden="true"
+                    />
+                  )}
                 </span>
               )}
             </a>
@@ -246,6 +265,7 @@ export function AppShell() {
               )}
             </nav>
             <span className="spacer" />
+            <VersionUpdateTrigger />
             <LanguageToggle />
             <ThemeToggle />
           </header>

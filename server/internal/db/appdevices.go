@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -203,8 +204,16 @@ func (d *DB) RevokeDevice(id int64) error {
 
 // CleanupPairingCodes 定期清掉过期超过 1 小时的配对码(后台 goroutine 调)
 func (d *DB) CleanupPairingCodes() {
+	d.CleanupPairingCodesContext(context.Background())
+}
+
+// CleanupPairingCodesContext 支持 ctx 取消的配对码清理，纳入优雅退出链。
+func (d *DB) CleanupPairingCodesContext(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	// 列存的是 RFC3339 字符串,绑 time.Time 会被 driver 格式化成带空格的串,
 	// 'T'(0x54) > ' '(0x20) 让比较恒为假,一行都删不掉 —— 必须同格式绑定
-	_, _ = d.Exec(`DELETE FROM app_pairing_codes WHERE expires_at < ?`,
+	_, _ = d.ExecContext(ctx, `DELETE FROM app_pairing_codes WHERE expires_at < ?`,
 		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339))
 }

@@ -4,7 +4,7 @@
 
 **面向 OVHcloud 独立服务器、Eco 系列与 VPS 的全生命周期管理与实时库存控制台**
 
-[![Version](https://img.shields.io/badge/version-v0.4.37-2563EB?style=for-the-badge)](https://github.com/w0ven/ovh-console/releases)
+[![Version](https://img.shields.io/badge/version-v0.4.38-2563EB?style=for-the-badge)](https://github.com/w0ven/ovh-console/releases)
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=111827)](https://react.dev/)
 [![Docker](https://img.shields.io/badge/Docker-linux%2Famd64%20%7C%20arm64-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/w0ven/ovh-console/pkgs/container/ovh-console)
@@ -218,7 +218,7 @@ DELETE  /*
 │       ├── hooks/          # TanStack Query 数据与状态 Hooks
 │       ├── i18n/           # 模块化中英文语言包与错误码映射
 │       └── routes/         # TanStack 文件路由页面
-├── Dockerfile              # 多阶段构建（Node 22 + Go 1.27 + Alpine 3.20）
+├── Dockerfile              # 多阶段构建（Node 22 + Go 1.27 + Alpine 3.23）
 ├── docker-compose.yml      # 生产级 Compose 编排配置（含日志轮转）
 └── VERSION                 # 当前应用版本号
 ```

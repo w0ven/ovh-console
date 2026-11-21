@@ -37,6 +37,20 @@ func getProgress() updater.Progress {
 	return updateProgress
 }
 
+// SetUpdateFailed 由退出协调器在自更新中止或失败时同步写回 /api/version/update/status，
+// 使前端轮询能够第一时间观测到明确失败状态，而不是苦等到超时。
+func SetUpdateFailed(msg string) {
+	updateMu.Lock()
+	ver := updateProgress.Version
+	updateProgress = updater.Progress{
+		Phase:   "failed",
+		Version: ver,
+		Message: "更新中止",
+		Error:   msg,
+	}
+	updateMu.Unlock()
+}
+
 // updateRunning 是否有更新正在进行
 func updateRunning() bool {
 	switch getProgress().Phase {

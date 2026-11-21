@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,10 +44,14 @@ func ecoCatalogURL(subsidiary string) string {
 
 // fetchEcoCatalogBody 拉公开目录并把 body 交给 parse 处理(不带凭据,不占账户配额)。
 func fetchEcoCatalogBody(subsidiary string, parse func(io.Reader) error) error {
+	return fetchEcoCatalogBodyContext(context.Background(), subsidiary, parse)
+}
+
+func fetchEcoCatalogBodyContext(ctx context.Context, subsidiary string, parse func(io.Reader) error) error {
 	// 公开目录是按子公司缓存、跨账户共享的,按账户隔离没有意义 ——
 	// 但仍然别拿本机真实 IP 去打,走统一出口(见 netfp.Shared 的说明)。
 	httpClient := netfp.Shared(60 * time.Second)
-	req, err := http.NewRequest(http.MethodGet, ecoCatalogURL(subsidiary), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ecoCatalogURL(subsidiary), nil)
 	if err != nil {
 		return err
 	}
@@ -702,6 +707,14 @@ func regionBucketForSubsidiary(subsidiary string) string {
 // 首次解析要拉一份 10MB 的目录(实测 2-7 秒),放在抢购那一单的链路里等于白白让掉先手;
 // 启动时先拉好,后续下单直接命中内存。失败不影响功能(下单时会自己重试或走静态兜底)。
 func WarmRegionCache(state *app.State) {
+	WarmRegionCacheWithContext(context.Background(), state)
+}
+
+// WarmRegionCacheWithContext 支持通过 ctx 在 I/O 进行中取消的区域配置预热。
+func WarmRegionCacheWithContext(ctx context.Context, state *app.State) {
+	if ctx.Err() != nil {
+		return
+	}
 	state.AccountsMu.RLock()
 	subs := map[string]struct{}{}
 	for _, a := range state.Accounts {
@@ -710,10 +723,55 @@ func WarmRegionCache(state *app.State) {
 	state.AccountsMu.RUnlock()
 
 	for s := range subs {
-		if _, err := loadSubsidiaryCatalog(state, s); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := loadSubsidiaryCatalogContext(ctx, state, s); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			state.Logger.Warn(fmt.Sprintf("[region] 预热 %s 目录失败(下单时会重试): %s", s, err.Error()), "purchase")
 		}
 	}
+}
+
+func loadSubsidiaryCatalogContext(ctx context.Context, state *app.State, subsidiary string) (*subsidiaryCatalog, error) {
+	subsidiary = strings.ToUpper(strings.TrimSpace(subsidiary))
+	if subsidiary == "" {
+		return nil, fmt.Errorf("缺少 ovhSubsidiary,无法确定要拉哪个站点的目录")
+	}
+	regionCacheMu.Lock()
+	if c, ok := regionCache[subsidiary]; ok && time.Since(c.fetchedAt) < regionCacheTTL {
+		regionCacheMu.Unlock()
+		return c, nil
+	}
+	regionCacheMu.Unlock()
+
+	var payload ecoCatalogPayload
+	if err := fetchEcoCatalogBodyContext(ctx, subsidiary, func(r io.Reader) error {
+		p, err := parseEcoCatalogFull(r)
+		if err != nil {
+			return fmt.Errorf("解析 %s 目录失败: %w", subsidiary, err)
+		}
+		payload = p
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	parsed := &subsidiaryCatalog{
+		plans:     payload.plans,
+		addons:    payload.addons,
+		currency:  payload.currency,
+		fetchedAt: time.Now(),
+	}
+	regionCacheMu.Lock()
+	regionCache[subsidiary] = parsed
+	delete(regionCacheFail, subsidiary)
+	regionCacheMu.Unlock()
+	if state != nil && state.Logger != nil {
+		state.Logger.Info(fmt.Sprintf("[region] 已缓存 %s 目录的区域配置(%d 个 plan)", subsidiary, len(parsed.plans)), "purchase")
+	}
+	return parsed, nil
 }
 
 // PlanPrice 一套配置的完整报价。

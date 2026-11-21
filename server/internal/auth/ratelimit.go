@@ -64,19 +64,39 @@ func recordAuthFailure(ip string, now time.Time) {
 	}
 	failMu.Lock()
 	defer failMu.Unlock()
+	b, ok := failByIP[ip]
+	if ok {
+		if now.Sub(b.windowStart) >= AuthFailureWindow {
+			b.count = 1
+			b.windowStart = now
+			return
+		}
+		b.count++
+		return
+	}
 	if len(failByIP) >= maxTrackedIPs {
 		for k, v := range failByIP {
 			if now.Sub(v.windowStart) >= AuthFailureWindow {
 				delete(failByIP, k)
 			}
 		}
+		// 清理过期项后若仍达上限，按最旧窗口淘汰，避免海量随机 IP（如 IPv6 轮换）撑爆内存。
+		for len(failByIP) >= maxTrackedIPs {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range failByIP {
+				if oldestKey == "" || v.windowStart.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.windowStart
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(failByIP, oldestKey)
+		}
 	}
-	b, ok := failByIP[ip]
-	if !ok || now.Sub(b.windowStart) >= AuthFailureWindow {
-		failByIP[ip] = &failBucket{count: 1, windowStart: now}
-		return
-	}
-	b.count++
+	failByIP[ip] = &failBucket{count: 1, windowStart: now}
 }
 
 // clearAuthFailures 密钥正确时清零 —— 打错一次的正常用户不该被后面的请求连坐。

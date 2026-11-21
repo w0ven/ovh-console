@@ -113,13 +113,21 @@ func (s *State) PauseMonitorQueues(scopes []MonitorQueueScope) (int, error) {
 	if count == 0 {
 		return 0, nil
 	}
+	// 一旦修改了内存任务状态（paused）并取消执行，立即登记关键队列脏代次：
+	// 无论后续因 SaveBlocked / DB==nil / ReplaceQueue 失败而返回错误，
+	// 均确保 HasPendingCriticalQueueSave() == true（阻断自更新重启并在停机前触发补救落盘）。
+	snapGen := s.MarkQueueCriticalDirtyLocked()
 	if err := s.SaveBlocked("queue"); err != nil {
 		return count, err
 	}
 	if s.DB == nil {
 		return count, fmt.Errorf("数据库不可用,关联抢购任务仅在本次运行中暂停")
 	}
-	return count, s.DB.ReplaceQueue(s.Queue)
+	if err := s.DB.ReplaceQueue(s.Queue); err != nil {
+		return count, err
+	}
+	s.advanceQueuePersistedGen(snapGen)
+	return count, nil
 }
 
 // HeldMonitorTasks 返回被监控暂停连带暂停、且属于 scope 的任务 ID;

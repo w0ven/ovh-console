@@ -29,6 +29,8 @@ export interface UpdateCheck {
   body: string;
   prerelease: boolean;
   checkedAt: string;
+  /** 最近一次刷新检查失败的原因（后端沿用上次成功快照时非空），界面据此提示“上次刷新失败”而不误报“已是最新” */
+  lastError?: string;
   /** 跑在容器里。自更新在容器里是停用的 —— 新二进制只会写进容器的可写层，
    *  容器一重建就回到镜像里的旧版本。界面据此显示「怎么拉新镜像」而不是更新按钮。 */
   inContainer?: boolean;
@@ -37,15 +39,15 @@ export interface UpdateCheck {
 }
 
 /** 检查上游 (w0ven/ovh-console) 是否有新版本。
- *  - 后端不缓存,收到请求就直连 GitHub
- *  - 前端 staleTime 1 小时,同一会话内访问仪表盘不会反复打 GitHub(避免触发 60 次/小时未鉴权限速)
- *  - 不监听 focus、不轮询,仅在组件 mount 且 stale 时触发一次
+ *  - 后端已按 5 分钟 ETag 增量轮询并带 15 分钟缓存 + singleflight，前端切页/聚焦可安全低开销刷新
+ *  - 全局 AppShell 顶栏与仪表盘共用同一 queryKey，全站任意页面均可第一时间显示新版本红点与版本弹窗
  */
 export function useUpdateCheck() {
   return useQuery<UpdateCheck>({
     queryKey: ["app", "update-check"],
     queryFn: async () => (await api.get<UpdateCheck>("/version/check-update")).data,
-    staleTime: 15 * 60 * 1000, // 15min:发新版后最多一刻钟就会出现更新按钮
+    staleTime: 5 * 60 * 1000, // 5min，对齐后端 ETag 刷新周期
+    refetchInterval: 5 * 60 * 1000,
     gcTime: 24 * 60 * 60 * 1000,
     retry: 1,
     refetchOnWindowFocus: true,
@@ -70,14 +72,25 @@ export function useSelfUpdate() {
   });
 }
 
-/** 轮询更新进度。enabled 时每秒一次 —— 更新是用户主动点的、有明确终点,
- *  这个频率只在更新期间存在,不会常驻。 */
-export function useUpdateProgress(enabled: boolean) {
+let nextUpdateProgressRunId = 0;
+
+/** 分配跨组件、跨挂载全局单调递增的更新轮次 ID，彻底杜绝 UpdateButton / VersionUpdateTrigger
+ *  以及重挂载组件在共享 QueryClient 下复用到上一轮遗留的 progress 缓存键。 */
+export function allocateUpdateProgressRunId(): number {
+  nextUpdateProgressRunId += 1;
+  return nextUpdateProgressRunId;
+}
+
+/** 轮询更新进度。enabled 时按 refetchIntervalMs 周期轮询（默认 1000ms） ——
+ *  更新是用户主动点的、有明确终点，这个频率只在更新期间存在，不会常驻。
+ *  runId 必须由 allocateUpdateProgressRunId() 分配。 */
+export function useUpdateProgress(enabled: boolean, runId: number, refetchIntervalMs = 1000) {
   return useQuery<UpdateProgress>({
-    queryKey: ["app", "update-progress"],
+    queryKey: ["app", "update-progress", runId],
     queryFn: async () => (await api.get<UpdateProgress>("/version/update/status")).data,
-    enabled,
-    refetchInterval: enabled ? 1000 : false,
+    enabled: enabled && runId > 0,
+    refetchInterval: enabled && runId > 0 ? refetchIntervalMs : false,
+    refetchIntervalInBackground: true,
     retry: 0,
     gcTime: 0,
   });

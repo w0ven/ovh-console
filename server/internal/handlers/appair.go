@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -133,12 +134,48 @@ func CreatePairingCode(state *app.State) gin.HandlerFunc {
 	}
 }
 
-// pairURL 生成 App 可识别的配对 URL(ovhconsole://pair?host=...&code=...)
+var (
+	trustedProxyMu      sync.RWMutex
+	trustedProxyChecker func(remoteIP string) bool
+)
+
+// SetTrustedProxyChecker 注册可信代理判定函数（与 main.go 的 TRUSTED_PROXIES 对齐）。
+// 仅在请求直连对端命中可信代理时，pairURL 才采信 X-Forwarded-Proto。
+func SetTrustedProxyChecker(fn func(remoteIP string) bool) {
+	trustedProxyMu.Lock()
+	trustedProxyChecker = fn
+	trustedProxyMu.Unlock()
+}
+
+func isTrustedProxyPeer(remoteAddr string) bool {
+	trustedProxyMu.RLock()
+	fn := trustedProxyChecker
+	trustedProxyMu.RUnlock()
+	if fn == nil || remoteAddr == "" {
+		return false
+	}
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	return fn(strings.TrimSpace(host))
+}
+
+// pairURL 生成 App 可识别的配对 URL；前端会优先按浏览器 location.origin 拼接，
+// 后端仅在 TLS 直连或直连对端命中可信反代（TRUSTED_PROXIES）时才采信 X-Forwarded-Proto。
 func pairURL(c *gin.Context, code string) string {
 	scheme := "https"
 	if c.Request.TLS == nil {
-		// 本地 http 部署(127.0.0.1:19998)也要能配对;App 侧对私有地址允许明文
-		scheme = "http"
+		if isTrustedProxyPeer(c.Request.RemoteAddr) {
+			if proto := strings.ToLower(strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Proto"), ",")[0])); proto == "https" {
+				scheme = "https"
+			} else {
+				scheme = "http"
+			}
+		} else {
+			// 本地 http 部署(127.0.0.1:19998)或未配置可信反代时忽略客户端自报的转发头
+			scheme = "http"
+		}
 	}
 	host := c.Request.Host
 	return scheme + "://" + host + "/api/app/pair#" + code

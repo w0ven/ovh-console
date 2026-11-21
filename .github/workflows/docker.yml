@@ -1,106 +1,257 @@
 name: Docker
 
-# 只在打 tag 时触发。
-#
-# 仓库里另一个 CI 是纯手动（workflow_dispatch）—— 那是刻意的，
-# 不想每次 push 都烧 Actions 额度。这个也遵守同样的原则：
-# tag 是明确的发布动作，一次发布跑一次，不是每次提交都跑。
-#
-# 注意：发布流程是本地 build.sh --release 创建 tag 和 Release。
-# 用个人 token 通过 API 创建 tag 会产生 push 事件，所以这个 workflow 会被触发。
-# 万一没触发（GitHub 对某些 token 创建的 tag 不派发事件），
-# 到 Actions 页面用 workflow_dispatch 手动跑一次，填那个 tag 即可。
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建的 tag（例 v0.1.16）。留空则用当前分支 HEAD"
-        required: false
+        description: "指定要构建并推送的稳定版本 tag（格式 vX.Y.Z）"
+        required: true
         type: string
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  # 统一安全前置门禁：严格校验整串单行稳定版 tag、VERSION 文件与目标提交 SHA，并在同一检出上跑通前后端全部检查。
+  verify:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # 推 ghcr.io 需要这个；用内置的 GITHUB_TOKEN，不必额外配 secret
-      packages: write
-
+    concurrency:
+      group: docker-verify-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    outputs:
+      target_tag: ${{ steps.resolve.outputs.target_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      major_minor: ${{ steps.resolve.outputs.major_minor }}
+      sha: ${{ steps.sha.outputs.sha }}
     steps:
-      - name: 取出代码
+      - name: 解析并严格校验整串单行稳定版 Tag（拒绝换行注入）
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          if [[ "$TAG" == *$'\n'* ]] || [[ "$TAG" == *$'\r'* ]] || [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Docker 发布仅接受单行稳定版 tag（格式 vX.Y.Z），当前输入非法"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          MAJOR_MINOR="$(printf '%s' "$VERSION" | awk -F. '{print $1 "." $2}')"
+          {
+            echo "target_tag=$TAG"
+            echo "version=$VERSION"
+            echo "major_minor=$MAJOR_MINOR"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 按已验证的完整 tag ref 检出代码
         uses: actions/checkout@v4
         with:
-          # 手动触发且填了 tag 就构建那个 tag，否则构建触发这次的 ref
-          ref: ${{ inputs.tag || github.ref }}
+          ref: refs/tags/${{ steps.resolve.outputs.target_tag }}
+          fetch-depth: 0
 
-      - name: 核对 VERSION 与 tag 是否一致
-        # 版本号是通过 ldflags 注入二进制的，前端和自更新都读它。
-        # 和 tag 对不上的话，用户装了 v0.1.16 的镜像、界面上显示 0.1.15，
-        # 自更新还会以为有新版可更 —— 这种不一致很难查，不如在这里直接拦住。
+      - name: 核验远端 tag 与本地 HEAD 及 VERSION 文件精确一致
+        id: sha
+        shell: bash
+        env:
+          TARGET_TAG: ${{ steps.resolve.outputs.target_tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
           FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
-          RAW_REF="${{ inputs.tag || github.ref_name }}"
-          TAG_VERSION="${RAW_REF#v}"
-          echo "VERSION 文件: $FILE_VERSION"
-          echo "tag:          $TAG_VERSION"
-          if [ "${{ github.event_name }}" = "push" ] && [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::VERSION 文件是 $FILE_VERSION，但 tag 是 $TAG_VERSION —— 两者必须一致"
+          if [ "$FILE_VERSION" != "$VERSION" ]; then
+            echo "::error::VERSION 文件为 ${FILE_VERSION}，与目标 tag ${TARGET_TAG} (${VERSION}) 不一致"
             exit 1
           fi
+          HEAD_SHA="$(git rev-parse HEAD)"
+          REMOTE_RAW="$(git ls-remote origin "refs/tags/${TARGET_TAG}^{}" "refs/tags/${TARGET_TAG}")"
+          REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$REMOTE_DEREF" ]; then
+            REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '{print $1; exit}')"
+          fi
+          if [ -z "$REMOTE_DEREF" ] || [ "$REMOTE_DEREF" != "$HEAD_SHA" ]; then
+            echo "::error::远端 refs/tags/${TARGET_TAG} (${REMOTE_DEREF:-<missing>}) 与检出 HEAD (${HEAD_SHA}) 不一致"
+            exit 1
+          fi
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_ENV"
 
-      - name: 配置 QEMU
-        # 交叉编译本身由 Go 完成（CGO_ENABLED=0），不需要 QEMU 跑构建；
-        # 但 alpine 运行时层要拉对应架构的基础镜像，仍然需要 binfmt 支持。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Verify Docker release script (all branches)
+        shell: bash
+        run: bash .github/scripts/docker-release.test.sh
+
+      - name: Verify Go formatting, vet, pure-Go & race tests
+        working-directory: server
+        run: |
+          set -euo pipefail
+          UNFMT=$(gofmt -l .)
+          if [ -n "$UNFMT" ]; then
+            echo "::error::Unformatted Go files:"
+            echo "$UNFMT"
+            exit 1
+          fi
+          go vet ./...
+          CGO_ENABLED=0 go test -short -count=1 ./...
+          CGO_ENABLED=1 go test -race -short -count=1 ./...
+
+      - name: Verify Frontend tests and production build
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+          npm run build
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-build-${{ needs.verify.outputs.target_tag }}
+      cancel-in-progress: false
+    outputs:
+      digest: ${{ steps.resolve_digest.outputs.digest }}
+      image_lc: ${{ steps.meta.outputs.image_lc }}
+    steps:
+      - name: 严格按 verify 通过的精确提交 SHA 检出代码（杜绝运行未验证分支/移动后 tag 的脚本）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: 配置 Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 登录 GitHub 镜像仓库
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 生成镜像标签
+      - name: 严格区分 manifest 不存在与查询故障，双架构核验已有不可变镜像或放行新构建
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          # ghcr.io 的路径必须全小写，仓库名里有大写字母会直接被拒
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-          labels: |
-            org.opencontainers.image.title=OVH 控制台
-            org.opencontainers.image.description=OVH 服务器抢购 / 监控 / 生命周期管理
+        shell: bash
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TARGET_TAG: ${{ needs.verify.outputs.target_tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: bash .github/scripts/docker-release.sh prepare-build
 
-      - name: 构建并推送
+      - name: 推送前二次复核远端 tag 未移动
+        if: steps.meta.outputs.skip_build != 'true'
+        shell: bash
+        env:
+          TARGET_TAG: ${{ needs.verify.outputs.target_tag }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REMOTE_RAW="$(git ls-remote origin "refs/tags/${TARGET_TAG}^{}" "refs/tags/${TARGET_TAG}")"
+          REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$REMOTE_DEREF" ]; then
+            REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '{print $1; exit}')"
+          fi
+          if [ "$REMOTE_DEREF" != "$EXPECTED_SHA" ]; then
+            echo "::error::构建前检测到远端 refs/tags/${TARGET_TAG} 已移动到 ${REMOTE_DEREF:-<missing>}（预期 ${EXPECTED_SHA}），中止推送"
+            exit 1
+          fi
+
+      - name: Build and push immutable multi-arch image
+        id: build
+        if: steps.meta.outputs.skip_build != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 缓存存在 GitHub Actions 自己的缓存里，下一次构建前端依赖那层能直接命中
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 输出拉取命令
+      - name: 汇总并推送后复核不可变双架构镜像 digest 与 revision
+        id: resolve_digest
+        shell: bash
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+          REUSED: ${{ steps.meta.outputs.reused_digest }}
+          BUILT: ${{ steps.build.outputs.digest }}
         run: |
-          echo "### 镜像已推送" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo '${{ steps.meta.outputs.tags }}' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          FINAL="${REUSED:-$BUILT}"
+          if [ -z "$FINAL" ]; then
+            echo "::error::未能获得不可变镜像 digest"
+            exit 1
+          fi
+          DIGEST="$FINAL" bash .github/scripts/docker-release.sh verify-pushed
+          echo "digest=${FINAL}" >> "$GITHUB_OUTPUT"
+
+  # 幂等收敛所有浮动标签（各 major.minor 系列与 latest）：
+  # 阶段 1 完成全部目标 digest + 全部现有浮动标签 digest 的只读探测，任一探测失败立即中止且零写入；
+  # 阶段 2 全部探测确定无误后统一执行幂等写入。
+  reconcile-floating-tags:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-floating-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: 严格按 verify 通过的精确提交 SHA 检出代码以执行已验证脚本并查询远端稳定 tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 两阶段严格对账并幂等收敛 latest 与全部 major.minor 浮动标签
+        shell: bash
+        env:
+          TARGET_TAG: ${{ needs.verify.outputs.target_tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+          IMAGE_LC: ${{ needs.build.outputs.image_lc }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: bash .github/scripts/docker-release.sh reconcile-floating

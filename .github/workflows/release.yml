@@ -1,0 +1,261 @@
+name: Release
+
+# 打稳定版 vX.Y.Z tag 或手动指定已存在稳定版 tag 时，先对同一 SHA 执行完整前后端校验，
+# 通过后再构建五平台单二进制（内嵌前端）并发布正式 GitHub Release。
+# 产物命名与 checksums.txt 格式严格对齐 server/internal/updater/updater.go。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的已存在稳定版 tag（例 v0.4.38）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify Release SHA
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: 校验并解析稳定版 tag
+        id: target
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW_TAG="$INPUT_TAG"
+          else
+            RAW_TAG="$REF_NAME"
+          fi
+          # 仅放行稳定版 vMAJOR.MINOR.PATCH，避免预发布 tag 污染正式更新渠道
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::仅支持稳定版 tag 格式 vMAJOR.MINOR.PATCH（如 v0.4.38），收到: $RAW_TAG"
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 按完整 tag ref 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+
+      - name: 核对 VERSION 与 tag 一致并记录提交 SHA
+        id: resolve
+        env:
+          RAW_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          TAG_VERSION="${RAW_TAG#v}"
+          SHA="$(git rev-parse HEAD)"
+          echo "VERSION 文件: $FILE_VERSION"
+          echo "tag:          $RAW_TAG"
+          echo "commit SHA:   $SHA"
+          if [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::VERSION 文件是 $FILE_VERSION，但 tag 是 $RAW_TAG —— 两者必须一致"
+            exit 1
+          fi
+          echo "version=$FILE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: server/go.sum
+
+      - name: 后端格式、静态检查与全量测试
+        working-directory: server
+        run: |
+          set -euo pipefail
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "以下文件未 gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+          go vet ./...
+          CGO_ENABLED=0 go test -short -count=1 ./...
+          go test -race -short -count=1 ./...
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 前端测试、构建与类型检查
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+          npm run build
+
+  release:
+    name: Build & Publish Binaries
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 按已校验 SHA 检出代码并核验 tag 仍指向同一 SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 0
+
+      - name: 复核远端 tag 指向同一已验证 SHA
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REMOTE_RAW="$(git ls-remote origin "refs/tags/${TAG}^{}" "refs/tags/${TAG}")"
+          REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$REMOTE_DEREF" ]; then
+            REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '{print $1; exit}')"
+          fi
+          if [ -z "$REMOTE_DEREF" ] || [ "$REMOTE_DEREF" != "$EXPECTED_SHA" ]; then
+            echo "::error::远端 refs/tags/$TAG 当前指向 ${REMOTE_DEREF:-<missing>}，与已验证 SHA $EXPECTED_SHA 不一致，中止发布"
+            exit 1
+          fi
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端（输出至 server/web）
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: server/go.sum
+
+      - name: 交叉编译五平台静态单二进制并自检校验和
+        working-directory: server
+        env:
+          VER: ${{ needs.verify.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/dist
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          LDFLAGS="-s -w -X github.com/ovh-buy/server/internal/handlers.Version=${VER}"
+
+          build() {
+            local os="$1"
+            local arch="$2"
+            local ext="${3:-}"
+            local name="ovh-server-${os}-${arch}${ext}"
+            echo "==> Building ${name} (version=${VER})"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -tags ui -trimpath -ldflags "$LDFLAGS" \
+              -o "${OUT_DIR}/${name}" .
+          }
+
+          build linux amd64
+          build linux arm64
+          build darwin amd64
+          build darwin arm64
+          build windows amd64 .exe
+
+          cd "$OUT_DIR"
+          LC_ALL=C sha256sum \
+            ovh-server-darwin-amd64 \
+            ovh-server-darwin-arm64 \
+            ovh-server-linux-amd64 \
+            ovh-server-linux-arm64 \
+            ovh-server-windows-amd64.exe > checksums.txt
+          sha256sum -c checksums.txt
+          cat checksums.txt
+
+      - name: 幂等发布正式 GitHub Release（发布前再查远端 tag SHA + 全资产摘要核验，不覆写已发布正式资产）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.sha }}
+          OUT_DIR: ${{ github.workspace }}/dist
+        run: |
+          set -euo pipefail
+          # 临发布前最后一次向远端查询 tag 解引用后的 commit SHA，阻断编译窗口内移动 tag
+          REMOTE_RAW="$(git ls-remote origin "refs/tags/${TAG}^{}" "refs/tags/${TAG}")"
+          REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$REMOTE_DEREF" ]; then
+            REMOTE_DEREF="$(printf '%s\n' "$REMOTE_RAW" | awk '{print $1; exit}')"
+          fi
+          if [ -z "$REMOTE_DEREF" ] || [ "$REMOTE_DEREF" != "$EXPECTED_SHA" ]; then
+            echo "::error::发布前复核失败：远端 refs/tags/$TAG (${REMOTE_DEREF:-<missing>}) != 已验证 SHA $EXPECTED_SHA"
+            exit 1
+          fi
+
+          EXPECTED_ASSETS=(
+            "ovh-server-darwin-amd64"
+            "ovh-server-darwin-arm64"
+            "ovh-server-linux-amd64"
+            "ovh-server-linux-arm64"
+            "ovh-server-windows-amd64.exe"
+            "checksums.txt"
+          )
+
+          if gh release view "$TAG" --json isDraft,isPrerelease,assets >/tmp/rel.json 2>/dev/null; then
+            IS_DRAFT="$(jq -r '.isDraft' /tmp/rel.json)"
+            IS_PRE="$(jq -r '.isPrerelease' /tmp/rel.json)"
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "检测到草稿 Release $TAG，补齐全部资产并转为正式版"
+              gh release upload "$TAG" "$OUT_DIR"/* --clobber
+              gh release edit "$TAG" --draft=false --prerelease=false
+              exit 0
+            fi
+            if [ "$IS_PRE" = "true" ]; then
+              echo "::error::Release $TAG 被标记为 prerelease，但本流水线仅发布稳定版；请人工核查"
+              exit 1
+            fi
+            echo "Release $TAG 已正式存在，逐项下载全部资产并校验 SHA-256..."
+            TMP_EXISTING="$(mktemp -d)"
+            for asset in "${EXPECTED_ASSETS[@]}"; do
+              if ! jq -e --arg name "$asset" '.assets[] | select(.name == $name)' /tmp/rel.json >/dev/null; then
+                echo "::error::正式 Release $TAG 缺少资产 $asset，拒绝静默放行"
+                exit 1
+              fi
+              gh release download "$TAG" --pattern "$asset" --dir "$TMP_EXISTING"
+            done
+            (cd "$TMP_EXISTING" && sha256sum -c checksums.txt)
+            if diff -u "$TMP_EXISTING/checksums.txt" "$OUT_DIR/checksums.txt"; then
+              echo "已发布全部 5 个二进制及 checksums.txt 逐项核验完全一致，幂等通过。"
+              exit 0
+            fi
+            echo "::error::正式 Release $TAG 已存在但资产摘要与本次构建不一致，拒绝静默覆盖；请发布新版本号"
+            exit 1
+          fi
+
+          gh release create "$TAG" "$OUT_DIR"/* \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes

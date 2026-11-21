@@ -167,6 +167,18 @@ type State struct {
 	saveHistoryMu sync.Mutex
 	saveServersMu sync.Mutex
 
+	// 关键队列状态持久化代次：
+	// queueGen / queueCriticalDirtyGen 在调用方已持有 QueueMu 时写入，并通过独立的极短锁
+	// criticalGenMu（永不执行 I/O）与 queuePersistedGen 保持原子可读；
+	// 因此 HasPendingCriticalQueueSave() 无需获取 QueueMu，绝不会被持锁的在途读/写操作阻塞。
+	// SaveQueue 在 saveQueueMu 内先拍快照并记录 snapGen，仅当 ReplaceQueue 成功返回后才推进 queuePersistedGen。
+	criticalGenMu         sync.Mutex
+	queueGen              uint64
+	queueCriticalDirtyGen uint64
+	queuePersistedGen     uint64
+	// replaceQueueFn 允许测试向 SaveQueue 持久化底层注入故障/屏障，生产环境默认为 s.DB.ReplaceQueue。
+	replaceQueueFn func([]types.QueueItem) error
+
 	// 启动时哪张表没读出来。
 	//
 	// Save* 全是"DELETE 整表 + 重新 INSERT 内存快照"。LoadAll 读失败时只记了条日志,
@@ -414,6 +426,53 @@ func (s *State) CountPurchase() (success, failed int) {
 //
 // 每类数据一把独立的保存锁:历史和队列互不阻塞。
 // 注意这把锁必须包住整个"快照+写库",而不只是写库。
+// MarkQueueCriticalDirtyLocked 必须在调用方已持有 s.QueueMu 时调用：
+// 为刚写入内存的关键队列状态（completed / paused / failed）分配单调递增代次并标记待持久化。
+func (s *State) MarkQueueCriticalDirtyLocked() uint64 {
+	s.criticalGenMu.Lock()
+	s.queueGen++
+	gen := s.queueGen
+	if gen > s.queueCriticalDirtyGen {
+		s.queueCriticalDirtyGen = gen
+	}
+	s.criticalGenMu.Unlock()
+	return gen
+}
+
+// MarkQueueCriticalDirty 供外部（如跨包测试）标记当前队列存在尚未落库的关键状态。
+func (s *State) MarkQueueCriticalDirty() uint64 {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	return s.MarkQueueCriticalDirtyLocked()
+}
+
+// advanceQueuePersistedGen 在整份队列成功写入 SQLite 后推进已持久化代次。
+// 所有全量覆盖写入 queue 表的路径（SaveQueue / EnqueueItems / UpdateQueueItem / PauseQueueByMonitor）
+// 都必须统一调用此方法，避免旧关键状态已随后续整表写入落盘后仍残留脏标志。
+func (s *State) advanceQueuePersistedGen(snapGen uint64) {
+	s.criticalGenMu.Lock()
+	if snapGen > s.queuePersistedGen {
+		s.queuePersistedGen = snapGen
+	}
+	s.criticalGenMu.Unlock()
+}
+
+// HasPendingCriticalQueueSave 返回是否存在尚未被成功 SaveQueue 覆盖的关键队列状态。
+// 仅获取永不执行 I/O 的极短互斥锁 criticalGenMu，不依赖 QueueMu，绝不因读/写接口持锁而阻塞退出路径。
+func (s *State) HasPendingCriticalQueueSave() bool {
+	s.criticalGenMu.Lock()
+	pending := s.queueCriticalDirtyGen > s.queuePersistedGen
+	s.criticalGenMu.Unlock()
+	return pending
+}
+
+// SetReplaceQueueFunc 仅供单测注入底层持久化钩子（传 nil 恢复默认 s.DB.ReplaceQueue）。
+func (s *State) SetReplaceQueueFunc(fn func([]types.QueueItem) error) {
+	s.saveQueueMu.Lock()
+	s.replaceQueueFn = fn
+	s.saveQueueMu.Unlock()
+}
+
 func (s *State) SaveQueue() error {
 	defer s.WakeQueue()
 	if err := s.SaveBlocked("queue"); err != nil {
@@ -424,8 +483,24 @@ func (s *State) SaveQueue() error {
 	s.QueueMu.Lock()
 	cp := make([]types.QueueItem, len(s.Queue))
 	copy(cp, s.Queue)
+	s.criticalGenMu.Lock()
+	snapGen := s.queueGen
+	s.criticalGenMu.Unlock()
 	s.QueueMu.Unlock()
-	return s.DB.ReplaceQueue(cp)
+
+	writeFn := s.replaceQueueFn
+	if writeFn == nil {
+		writeFn = s.DB.ReplaceQueue
+	}
+	if err := writeFn(cp); err != nil {
+		return err
+	}
+	s.criticalGenMu.Lock()
+	if snapGen > s.queuePersistedGen {
+		s.queuePersistedGen = snapGen
+	}
+	s.criticalGenMu.Unlock()
+	return nil
 }
 
 // MarkLoadFailed 记下某张表启动时没读出来,之后禁止覆盖写它。
@@ -533,10 +608,14 @@ func (s *State) enqueueItems(items []types.QueueItem, prepend, automatic bool) e
 		next = append(append(next, s.Queue...), items...)
 	}
 	// 与 SaveQueue 相同的锁顺序;提交前不让处理器读取待入队任务。
+	s.criticalGenMu.Lock()
+	snapGen := s.queueGen
+	s.criticalGenMu.Unlock()
 	if err := s.DB.ReplaceQueue(next); err != nil {
 		return err
 	}
 	s.Queue = next
+	s.advanceQueuePersistedGen(snapGen)
 	if !automatic {
 		for _, item := range items {
 			if err := s.SetAutomaticOrderBlockedLocked(item, false); err != nil {
@@ -593,10 +672,14 @@ func (s *State) UpdateQueueItem(id, datacenter string, options []string, retryIn
 		next[i].LastCheckTime = 0
 		next[i].OrderPhase = ""
 		next[i].UpdatedAt = types.NowISO()
+		s.criticalGenMu.Lock()
+		snapGen := s.queueGen
+		s.criticalGenMu.Unlock()
 		if err := s.DB.ReplaceQueue(next); err != nil {
 			return err
 		}
 		s.Queue = next
+		s.advanceQueuePersistedGen(snapGen)
 		if active {
 			// 换了机房时新机房的自动建单停止记录也要解除,与恢复任务一致
 			if err := s.SetAutomaticOrderBlockedLocked(next[i], false); err != nil {

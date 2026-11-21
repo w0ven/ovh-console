@@ -999,3 +999,188 @@ test("presale preparation timing phases are translated in tooltips", async () =>
     }
   } finally { await i18n.changeLanguage(original); }
 });
+
+test("buildPairUrl prefers browser origin over reverse-proxy http fallback", async () => {
+  const { buildPairUrl } = await server.ssrLoadModule("/src/lib/pair-url.ts");
+  assert.equal(
+    buildPairUrl("ABCD1234", "http://ovh.ke1e.de/api/app/pair#ABCD1234", "https://ovh.ke1e.de"),
+    "https://ovh.ke1e.de/api/app/pair#ABCD1234",
+  );
+  assert.equal(
+    buildPairUrl("ABCD1234", "http://127.0.0.1:20000/api/app/pair#ABCD1234", ""),
+    "http://127.0.0.1:20000/api/app/pair#ABCD1234",
+  );
+  assert.equal(buildPairUrl(undefined, "http://fallback", "https://ovh.ke1e.de"), "http://fallback");
+});
+
+test("VersionUpdateTrigger shows update indicator pill, distinguishes error/loading/upToDate states, and handles restart polling safely", async () => {
+  const { VersionUpdateTrigger, deriveUpdateViewState, probeRestartStep } = await server.ssrLoadModule(
+    "/src/components/common/VersionUpdateTrigger.tsx",
+  );
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const original = i18n.language;
+  try {
+    // 1. 状态机必须严格区分 loading / error / unknown / upToDate / available，不把失败误判为已是最新
+    assert.equal(deriveUpdateViewState({ isPending: true, isError: false }), "loading");
+    assert.equal(deriveUpdateViewState({ isPending: false, isError: true }), "error");
+    assert.equal(deriveUpdateViewState({ isPending: false, isError: false }), "unknown");
+    assert.equal(
+      deriveUpdateViewState({
+        isPending: false,
+        isError: false,
+        check: { current: "0.4.38", latest: "0.4.38", hasUpdate: false },
+      }),
+      "upToDate",
+    );
+    assert.equal(
+      deriveUpdateViewState({
+        isPending: false,
+        isError: false,
+        check: { current: "0.4.37", latest: "0.4.38", hasUpdate: true },
+      }),
+      "available",
+    );
+    // 已有上次相同版本快照，随后刷新失败（TanStack Query isError 或后端 lastError）：绝不得伪装成 upToDate
+    assert.equal(
+      deriveUpdateViewState({
+        isPending: false,
+        isError: true,
+        check: { current: "0.4.38", latest: "0.4.38", hasUpdate: false },
+      }),
+      "staleError",
+    );
+    assert.equal(
+      deriveUpdateViewState({
+        isPending: false,
+        isError: false,
+        check: { current: "0.4.38", latest: "0.4.38", hasUpdate: false, lastError: "upstream 502" },
+      }),
+      "staleError",
+    );
+
+    // 2. 重启探针场景 A：旧版本持续响应 10 次（中间夹杂一次瞬时 fetchStatus 网络错误后仍返回 restarting）后经历断连并上线目标新版，全程不得误判回滚
+    let sawDisconnect = false;
+    for (let i = 0; i < 10; i++) {
+      const step = await probeRestartStep({
+        targetVersion: "0.4.38",
+        sawDisconnect,
+        fetchVersion: async () => "0.4.37",
+        fetchStatus: async () => {
+          if (i === 2) throw new Error("transient proxy 502");
+          return { phase: "restarting", message: "restarting", percent: 100, version: "0.4.38" };
+        },
+      });
+      sawDisconnect = step.nextSawDisconnect;
+      assert.equal(step.outcome.phase, "waiting");
+    }
+    const downStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect,
+      fetchVersion: async () => {
+        throw new Error("connection refused");
+      },
+      fetchStatus: async () => {
+        throw new Error("connection refused");
+      },
+    });
+    sawDisconnect = downStep.nextSawDisconnect;
+    assert.equal(sawDisconnect, true);
+    assert.equal(downStep.outcome.phase, "waiting");
+    const upStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect,
+      fetchVersion: async () => "0.4.38",
+      fetchStatus: async () => ({ phase: "idle", message: "", percent: 0, version: "" }),
+    });
+    assert.equal(upStep.outcome.phase, "updated");
+    assert.equal(upStep.outcome.version, "0.4.38");
+
+    // 2b. 重启探针场景 A2：进程在两次轮询间隙秒级完成替换，跳过 restarting/断连直接回到 idle + 新版本
+    const instantStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect: false,
+      fetchVersion: async () => "0.4.38",
+      fetchStatus: async () => ({ phase: "idle", message: "", percent: 0, version: "" }),
+    });
+    assert.equal(instantStep.outcome.phase, "updated");
+    assert.equal(instantStep.outcome.version, "0.4.38");
+
+    // 2c. 重启探针场景 A3：单端点瞬时 502（/status 报错但 /version 正常）绝不得置 sawDisconnect=true，
+    // 下一轮哪怕读到 idle + 旧版也不会误判回滚；只有双端点都失联后再恢复为 idle + 旧版才报告明确回滚
+    const singleErrStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect: false,
+      fetchVersion: async () => "0.4.37",
+      fetchStatus: async () => {
+        throw new Error("proxy 502 on status endpoint only");
+      },
+    });
+    assert.equal(singleErrStep.nextSawDisconnect, false);
+    assert.equal(singleErrStep.outcome.phase, "waiting");
+
+    const idleAfterSingleErr = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect: singleErrStep.nextSawDisconnect,
+      fetchVersion: async () => "0.4.37",
+      fetchStatus: async () => ({ phase: "idle", message: "", percent: 0, version: "" }),
+    });
+    assert.equal(idleAfterSingleErr.outcome.phase, "waiting");
+
+    // 真实双端点断连恢复后状态回到 idle 但仍为旧版本 -> 报告明确回滚
+    const rollbackStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect: true,
+      fetchVersion: async () => "0.4.37",
+      fetchStatus: async () => ({ phase: "idle", message: "", percent: 0, version: "" }),
+    });
+    assert.equal(rollbackStep.outcome.phase, "failed");
+    assert.equal(rollbackStep.outcome.version, "0.4.37");
+
+    // 3. 重启探针场景 B：后端因排空超时中止重启并将 status 置为 failed，前端立即识别失败
+    const abortStep = await probeRestartStep({
+      targetVersion: "0.4.38",
+      sawDisconnect: false,
+      fetchVersion: async () => "0.4.37",
+      fetchStatus: async () => ({
+        phase: "failed",
+        message: "更新中止",
+        percent: 0,
+        version: "0.4.38",
+        error: "后台任务未在期限内安全收尾，已中止自动重启",
+      }),
+    });
+    assert.equal(abortStep.outcome.phase, "failed");
+    assert.match(abortStep.outcome.error || "", /已中止自动重启/);
+
+    // 4. 双语渲染验证（胶囊红点）
+    for (const lang of ["zh", "en"]) {
+      await i18n.changeLanguage(lang);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      qc.setQueryData(["app", "version"], "0.4.37");
+      qc.setQueryData(["app", "update-check"], {
+        current: "0.4.37",
+        latest: "0.4.38",
+        tag: "v0.4.38",
+        name: "v0.4.38",
+        hasUpdate: true,
+        url: "https://github.com/w0ven/ovh-console/releases/tag/v0.4.38",
+        publishedAt: "2026-11-22T00:00:00Z",
+        body: "Release notes",
+        prerelease: false,
+        checkedAt: "2026-11-22T00:00:00Z",
+        inContainer: true,
+        updateHint: "docker compose pull && docker compose up -d",
+      });
+      const html = renderToStaticMarkup(
+        createElement(QueryClientProvider, { client: qc }, createElement(VersionUpdateTrigger)),
+      );
+      assert.match(html, /v0\.4\.37/);
+      assert.match(html, /bg-amber-500/);
+      assert.match(html, lang === "zh" ? /发现新版本 v0\.4\.38/ : /New version v0\.4\.38 available/);
+    }
+  } finally {
+    await i18n.changeLanguage(original);
+  }
+});
+
+

@@ -10,6 +10,7 @@ import { useTranslation } from "react-i18next";
 import { fmtDateTime } from "@/i18n/format";
 import { Section } from "@/routes/settings-sections";
 import { useAppDevices, useCreatePairingCode, useRevokeAppDevice } from "@/hooks/use-app-devices";
+import { buildPairUrl } from "@/lib/pair-url";
 import { Button } from "@/components/ui/button";
 
 /** 剩余秒数文案:过期后直接显示"已过期",不显示负数 */
@@ -41,6 +42,7 @@ export function AppPairingSection() {
   const { expired, label: countdown } = useCountdown(create.data?.expiresAt);
 
   const code = create.data?.code;
+  const pairUrl = buildPairUrl(code, create.data?.pairUrl);
 
   return (
     <Section title={t("settings.sections.app")}>
@@ -53,7 +55,7 @@ export function AppPairingSection() {
         {code && !expired ? (
           <>
             <div className="p-2.5 bg-white rounded-xl border border-border flex-shrink-0">
-              <QRCodeSVG value={create.data!.pairUrl} size={104} />
+              <QRCodeSVG value={pairUrl} size={104} />
             </div>
             <div className="min-w-0 flex-1 space-y-2">
               <p className="font-mono text-xl font-bold tracking-[0.3em] select-all">{code}</p>

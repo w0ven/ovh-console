@@ -115,7 +115,12 @@ func buildTaskFailedMessage(item *types.QueueItem, reason string, fatal bool) st
 
 // ProcessQueueLoop 持续执行未完成任务,已下单任务保留为只读记录。
 func ProcessQueueLoop(state *app.State) {
-	processQueueLoop(context.Background(), state, PurchaseServer)
+	ProcessQueueLoopWithContext(context.Background(), state)
+}
+
+// ProcessQueueLoopWithContext 执行抢购队列主循环，并在 ctx 取消时优雅停止所有 worker。
+func ProcessQueueLoopWithContext(ctx context.Context, state *app.State) {
+	processQueueLoop(ctx, state, PurchaseServer)
 }
 
 // processQueueLoop 为每个任务维护独立 worker,慢查询/落库/通知不再挡住其它机房。

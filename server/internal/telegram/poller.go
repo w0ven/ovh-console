@@ -79,6 +79,21 @@ type Poller struct {
 	lastErr   atomic.Value // string
 	lastPoll  atomic.Value // time.Time
 	offsetVal atomic.Int64
+
+	// prepareHook 仅用于测试在“网络准备完成之后、调用 admit 实际发布运行态并启动 loop 之前”注入确定性屏障；
+	// deleteWebhookFn 允许测试替换真实外网调用；loopFn 允许测试观测实际启动次数（均为 nil 时走生产实现）。
+	prepareHook     func()
+	deleteWebhookFn func(*app.State) (bool, string)
+	loopFn          func(int64)
+}
+
+// SetTestHooks 仅供单测注入无外网的准备阶段桩、准入前屏障及循环启动计数器。
+func (p *Poller) SetTestHooks(deleteWebhookFn func(*app.State) (bool, string), prepareHook func(), loopFn func(int64)) {
+	p.mu.Lock()
+	p.deleteWebhookFn = deleteWebhookFn
+	p.prepareHook = prepareHook
+	p.loopFn = loopFn
+	p.mu.Unlock()
 }
 
 // NewPoller 构造。handle 在每条 update 上被调用(串行)。
@@ -113,6 +128,13 @@ func (p *Poller) Status() map[string]interface{} {
 
 // Start 启动长轮询。会先 deleteWebhook —— 两者互斥,不删的话 getUpdates 直接报错。
 func (p *Poller) Start() error {
+	return p.StartWithAdmit(nil)
+}
+
+// StartWithAdmit 先在无锁状态完成 deleteWebhook 网络准备与 offset 恢复，再通过 admit 持锁准入回调
+// 将“发布运行态（p.running=true）并拉起轮询循环”与外部停机协调器的 beginShutdown 严格互斥：
+// 若准备期间已开始停机，admit 返回 false，绝不置 running=true，也绝不启动 p.loop。
+func (p *Poller) StartWithAdmit(admit func(launch func()) bool) error {
 	cfg := p.state.Config.Get()
 	if strings.TrimSpace(cfg.TgToken) == "" {
 		return fmt.Errorf("未配置 Telegram Bot Token")
@@ -123,16 +145,17 @@ func (p *Poller) Start() error {
 		p.mu.Unlock()
 		return nil // 已经在跑,幂等
 	}
-	p.generation++
-	gen := p.generation
-	p.running = true
+	delFn := p.deleteWebhookFn
+	prepHook := p.prepareHook
+	loopRunner := p.loopFn
 	p.mu.Unlock()
 
-	// webhook 和 polling 互斥:不先摘掉 webhook,getUpdates 会一直失败。
-	// drop_pending_updates 不传 —— 默认保留积压。
-	// 理由:自更新重启只花几秒,那几秒里按下的按钮不该丢。
-	// 积压里的老按钮有自己的 TTL 和一次性 claim 兜底,重复下单由 update_id 幂等表挡住。
-	if ok, msg := deleteWebhook(p.state); !ok {
+	if delFn == nil {
+		delFn = deleteWebhook
+	}
+
+	// 锁外完成网络准备（deleteWebhook）：不阻塞协调器停机锁，也不提前占 running 状态。
+	if ok, msg := delFn(p.state); !ok {
 		p.state.Logger.Warn("切换到长轮询前删除 webhook 失败(仍继续尝试): "+msg, "telegram")
 	} else {
 		p.state.Logger.Info("已删除 webhook,切换到长轮询模式", "telegram")
@@ -147,8 +170,39 @@ func (p *Poller) Start() error {
 		}
 	}
 
-	go p.loop(gen)
-	p.state.Logger.Info("Telegram 长轮询已启动(不需要公网地址)", "telegram")
+	if prepHook != nil {
+		prepHook()
+	}
+
+	// 持锁准入发布运行态并启动循环：保证一旦 beginShutdown 切离 running，绝不再发布 running=true 或拉起 loop！
+	launched := false
+	launch := func() {
+		p.mu.Lock()
+		if p.running {
+			p.mu.Unlock()
+			return
+		}
+		p.generation++
+		gen := p.generation
+		p.running = true
+		p.mu.Unlock()
+		launched = true
+		if loopRunner != nil {
+			go loopRunner(gen)
+		} else {
+			go p.loop(gen)
+		}
+	}
+	if admit != nil {
+		if !admit(launch) {
+			return nil
+		}
+	} else {
+		launch()
+	}
+	if launched {
+		p.state.Logger.Info("Telegram 长轮询已启动(不需要公网地址)", "telegram")
+	}
 	return nil
 }
 

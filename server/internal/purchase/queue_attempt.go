@@ -3,12 +3,79 @@ package purchase
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ovh-buy/server/internal/app"
 	"github.com/ovh-buy/server/internal/notify"
 	"github.com/ovh-buy/server/internal/types"
 )
+
+const (
+	retryNoStockLogInterval = 10 * time.Minute
+	maxTrackedRetryLogTasks = 2048
+)
+
+type retryNoStockLogState struct {
+	lastLogged time.Time
+	suppressed int
+}
+
+type retryNoStockLogThrottle struct {
+	mu    sync.Mutex
+	tasks map[string]*retryNoStockLogState
+	now   func() time.Time
+}
+
+var retryNoStockLogs = &retryNoStockLogThrottle{
+	tasks: map[string]*retryNoStockLogState{},
+	now:   time.Now,
+}
+
+// shouldLog 节流同一任务连续无货/重试失败日志：首次立刻输出，之后每 10 分钟最多汇总输出一次。
+func (t *retryNoStockLogThrottle) shouldLog(taskID string) (emit bool, suppressed int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	if st, ok := t.tasks[taskID]; ok {
+		if now.Sub(st.lastLogged) < retryNoStockLogInterval {
+			st.suppressed++
+			return false, 0
+		}
+		count := st.suppressed + 1
+		st.lastLogged = now
+		st.suppressed = 0
+		return true, count
+	}
+	if len(t.tasks) >= maxTrackedRetryLogTasks {
+		for k, v := range t.tasks {
+			if now.Sub(v.lastLogged) >= 2*retryNoStockLogInterval {
+				delete(t.tasks, k)
+			}
+		}
+		if len(t.tasks) >= maxTrackedRetryLogTasks {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range t.tasks {
+				if oldestKey == "" || v.lastLogged.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.lastLogged
+				}
+			}
+			if oldestKey != "" {
+				delete(t.tasks, oldestKey)
+			}
+		}
+	}
+	t.tasks[taskID] = &retryNoStockLogState{lastLogged: now}
+	return true, 0
+}
+
+func (t *retryNoStockLogThrottle) clear(taskID string) {
+	t.mu.Lock()
+	delete(t.tasks, taskID)
+	t.mu.Unlock()
+}
 
 // runQueueAttempt 只在内存登记尝试;结果返回后才持久化终态、历史和通知。
 func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, purchase func(context.Context, *app.State, *types.QueueItem) Outcome) (outcome Outcome) {
@@ -84,8 +151,10 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 				break
 			}
 		}
+		state.MarkQueueCriticalDirtyLocked()
 		state.QueueMu.Unlock()
-		_ = state.SaveQueue()
+		saveQueueCritical(state, it.ID, "paused(group_stopped)")
+		retryNoStockLogs.clear(it.ID)
 		return outcome
 	}
 	if outcome.PauseTask {
@@ -100,16 +169,19 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 				break
 			}
 		}
+		state.MarkQueueCriticalDirtyLocked()
 		state.QueueMu.Unlock()
 		if outcome.Reason != "" {
 			recordFailureStatus(state, &snapshot, outcome.Reason, "uncertain")
 		}
-		_ = state.SaveQueue()
+		saveQueueCritical(state, it.ID, "paused(checkout_uncertain)")
+		retryNoStockLogs.clear(it.ID)
 		state.Logger.Info("任务已暂停(结账结果不确定,等人工确认): "+it.PlanCode, "queue")
 		return outcome
 	}
 	if outcome.Cancelled {
 		// 用户删除或暂停,不计失败,不覆盖用户选择的队列状态。
+		retryNoStockLogs.clear(it.ID)
 		return outcome
 	}
 	if outcome.WaitingForCatalog || outcome.WaitingForQuota {
@@ -124,10 +196,12 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 				break
 			}
 		}
+		state.MarkQueueCriticalDirtyLocked()
 		state.QueueMu.Unlock()
 		// 成功即落库,不等轮末:checkout 成功到 SaveQueue 之间崩溃的话,
-		// 重启后任务复活再买一台(真金白银)。失败轮不落 —— 高频且可重建
-		_ = state.SaveQueue()
+		// 除 ClaimQueueOrder 持久化登记防重外,仍须立即重试落库并显式记录写库异常。
+		saveQueueCritical(state, it.ID, "completed")
+		retryNoStockLogs.clear(it.ID)
 		if finalRetry == 1 {
 			state.Logger.Info("首次尝试购买成功: "+it.PlanCode, "queue")
 		} else {
@@ -157,9 +231,17 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 	// 而且每一轮都往 history 写一条失败记录,把抢购历史刷满。
 	// 现在两道闸:确定性失败直接终止,其余按 MaxRetries 封顶。
 	if finalRetry == 1 {
+		retryNoStockLogs.clear(it.ID)
 		state.Logger.Info("首次尝试购买失败或服务器暂无货: "+it.PlanCode, "queue")
-	} else {
+	} else if outcome.Attempted || outcome.Fatal {
+		retryNoStockLogs.clear(it.ID)
 		state.Logger.Info("重试购买失败或服务器仍无货: "+it.PlanCode, "queue")
+	} else if emit, count := retryNoStockLogs.shouldLog(it.ID); emit {
+		if count > 1 {
+			state.Logger.Info(fmt.Sprintf("重试购买失败或服务器仍无货: %s (自上次记录以来累计 %d 次)", it.PlanCode, count), "queue")
+		} else {
+			state.Logger.Info("重试购买失败或服务器仍无货: "+it.PlanCode, "queue")
+		}
 	}
 
 	stopReason := ""
@@ -193,7 +275,9 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 			break
 		}
 	}
+	state.MarkQueueCriticalDirtyLocked()
 	state.QueueMu.Unlock()
+	saveQueueCritical(state, it.ID, "failed")
 	// 任务死了必须告诉用户。
 	//
 	// 以前这里只写日志:成功会 Broadcast 一条通知,失败终止却完全静默 ——
@@ -204,6 +288,7 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 	if msg, ok := failNotice.take(&snapshot, stopReason, outcome.Fatal); ok {
 		notify.Broadcast(state, msg, nil)
 	}
+	retryNoStockLogs.clear(it.ID)
 	state.Logger.Warn(fmt.Sprintf("任务 %s (%s @ %s) 置为 failed：%s",
 		it.ID, it.PlanCode, it.Datacenter, stopReason), "queue")
 	return outcome
@@ -218,4 +303,27 @@ func setOrderPhase(state *app.State, id, phase string) {
 			break
 		}
 	}
+}
+
+// saveQueueCritical 对关键状态迁移（completed / paused）做有限次同步重试落库。
+// 持久化代次的登记与推进完全内聚在 State.MarkQueueCriticalDirtyLocked + State.SaveQueue 内：
+// 只有实际包含最新关键状态代次的 ReplaceQueue 成功返回后，HasPendingCriticalQueueSave() 才会清零，
+// 杜绝旧快照返回清除新失败或直接调用 SaveQueue 不清标记的两类逻辑竞态。
+func saveQueueCritical(state *app.State, taskID, targetState string) bool {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := state.SaveQueue(); err == nil {
+			return true
+		} else {
+			lastErr = err
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+		}
+	}
+	if state.Logger != nil {
+		state.Logger.Error(fmt.Sprintf("任务 %s 关键状态(%s)持久化失败(重启后仍受 ClaimQueueOrder 防重保护，请核对 OVH 订单): %v",
+			taskID, targetState, lastErr), "queue")
+	}
+	return false
 }

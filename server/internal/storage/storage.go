@@ -93,12 +93,30 @@ func ReadJSON(path string, v interface{}) error {
 }
 
 // WriteJSON 原子写 JSON 文件（先写 tmp 再 rename，避免崩溃半写）
+// 序列化与落盘均在同路径互斥锁内完成，避免慢序列化旧快照晚于新快照获取锁而覆盖新状态。
 func WriteJSON(path string, v interface{}) error {
+	return writeJSONAtomic(path, v, false)
+}
+
+// WriteJSONCompact 原子写紧凑格式 JSON 文件，用于高频刷盘的日志等场景以减少写放大。
+func WriteJSONCompact(path string, v interface{}) error {
+	return writeJSONAtomic(path, v, true)
+}
+
+func writeJSONAtomic(path string, v interface{}, compact bool) error {
 	m := lockFor(path)
 	m.Lock()
 	defer m.Unlock()
 
-	data, err := json.MarshalIndent(v, "", "  ")
+	var (
+		data []byte
+		err  error
+	)
+	if compact {
+		data, err = json.Marshal(v)
+	} else {
+		data, err = json.MarshalIndent(v, "", "  ")
+	}
 	if err != nil {
 		return err
 	}

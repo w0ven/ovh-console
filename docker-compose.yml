@@ -16,6 +16,8 @@ services:
     image: ghcr.io/w0ven/ovh-console:latest
     container_name: ovh-console
     restart: unless-stopped
+    # 留足优雅关闭窗口（先等抢购队列与在途 HTTP 收尾、再刷盘关库）
+    stop_grace_period: 30s
 
     ports:
       # 默认只绑回环。这个服务能用你的 OVH 账户下单、能重装服务器 ——

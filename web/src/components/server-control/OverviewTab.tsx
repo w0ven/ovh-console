@@ -1,13 +1,49 @@
+import { Component, lazy, Suspense, type ReactNode } from "react";
 import { Cpu, HardDrive, MemoryStick, MapPin, Globe, Wifi, AlertTriangle, PartyPopper } from "lucide-react";
 import type { OwnedServer } from "@/hooks/use-server-control";
 import { useServerHardware, useServerIps, useServerNetworkInterfaces, useHardwareLottery } from "@/hooks/use-server-control";
 import { useHideIp, maskSensitive } from "@/hooks/use-hide-ip";
 import { Skeleton } from "@/components/common/Skeleton";
 import { PartialNotice, DetailErrorTag } from "@/components/common/PartialNotice";
-import { MrtgTrafficChart } from "./MrtgTrafficChart";
 import { LotteryConfetti } from "./LotteryConfetti";
 import { LotteryReportPearl } from "@/components/pearl/LotteryReportPearl";
 import { useTranslation } from "react-i18next";
+
+import i18n from "@/i18n";
+
+const MrtgTrafficChart = lazy(() =>
+  import("./MrtgTrafficChart").then((m) => ({ default: m.MrtgTrafficChart })),
+);
+
+/** 兜住跨版本发版后旧标签页按旧 hash 懒加载图表 chunk 失败（404）的异常，避免整页白屏 */
+class MrtgErrorBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="border border-border rounded-2xl p-6 text-center text-sm text-muted-foreground space-y-2">
+          <p>{i18n.t("commons.update.chartLoadFailed")}</p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="inline-flex items-center px-3 py-1.5 rounded-lg border border-border text-xs font-medium text-foreground hover:bg-secondary/60"
+          >
+            {i18n.t("commons.update.reloadPage")}
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /** 概览 Tab：硬件 + 网络（IP / 接口 / MRTG 流量）。服务信息胶囊条已上提到 ServerTabs 同行 */
 export function OverviewTab({ server }: { server: OwnedServer }) {
@@ -141,8 +177,12 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
         </div>
       </div>
 
-      {/* MRTG 流量监控 */}
-      <MrtgTrafficChart serviceName={server.serviceName} />
+      {/* MRTG 流量监控（懒加载 recharts 图表包，带错误边界防跨版本 chunk 404 白屏） */}
+      <MrtgErrorBoundary>
+        <Suspense fallback={<Skeleton className="h-64 rounded-2xl" />}>
+          <MrtgTrafficChart serviceName={server.serviceName} />
+        </Suspense>
+      </MrtgErrorBoundary>
     </div>
   );
 }
