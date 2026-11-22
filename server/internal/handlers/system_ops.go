@@ -376,13 +376,12 @@ func MaintainDatabase(state *app.State) gin.HandlerFunc {
 	}
 }
 
-// ─── 一次性备份下载凭证管理（5 分钟 TTL + 单次消费 + 签发即计数限流 + 未消费上限 + 客户端 IP 绑定） ──
+// ─── 一次性备份下载凭证管理（5 分钟 TTL + 单次消费 + 签发即计数限流 + 未消费上限） ──
 
 type backupDownloadTicket struct {
 	backupID  string
 	redacted  bool
 	expiresAt time.Time
-	clientIP  string
 }
 
 type backupTicketStore struct {
@@ -404,7 +403,7 @@ func (s *backupTicketStore) now() time.Time {
 	return time.Now()
 }
 
-func (s *backupTicketStore) issue(backupID string, redacted bool, clientIP string) (string, time.Time, error) {
+func (s *backupTicketStore) issue(backupID string, redacted bool) (string, time.Time, error) {
 	var raw [24]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", time.Time{}, err
@@ -441,12 +440,11 @@ func (s *backupTicketStore) issue(backupID string, redacted bool, clientIP strin
 		backupID:  backupID,
 		redacted:  redacted,
 		expiresAt: exp,
-		clientIP:  clientIP,
 	}
 	return tok, exp, nil
 }
 
-func (s *backupTicketStore) consume(token, backupID, clientIP string) (backupDownloadTicket, bool) {
+func (s *backupTicketStore) consume(token, backupID string) (backupDownloadTicket, bool) {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -456,9 +454,6 @@ func (s *backupTicketStore) consume(token, backupID, clientIP string) (backupDow
 	}
 	delete(s.tickets, token) // 单次消费：无论校验是否匹配，使用后立刻作废
 	if now.After(t.expiresAt) || t.backupID != backupID {
-		return backupDownloadTicket{}, false
-	}
-	if t.clientIP != "" && clientIP != "" && t.clientIP != clientIP {
 		return backupDownloadTicket{}, false
 	}
 	return t, true
@@ -518,7 +513,7 @@ func CreateSystemBackup(state *app.State) gin.HandlerFunc {
 }
 
 // IssueBackupDownloadToken POST /api/system/backups/:id/download-token
-// 颁布 5 分钟有效、单次消费、绑定客户端 IP 的备份下载令牌（默认 redact=true 导出去凭据脱敏副本）。
+// 颁布 5 分钟有效、单次消费的备份下载令牌（不强绑回源 IP 以兼容 Cloudflare / CDN 多边缘回源）。
 func IssueBackupDownloadToken(state *app.State) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		backupID := strings.TrimSpace(c.Param("id"))
@@ -537,7 +532,7 @@ func IssueBackupDownloadToken(state *app.State) gin.HandlerFunc {
 			redact = *req.Redact
 		}
 
-		tok, exp, err := backupTickets.issue(backupID, redact, c.ClientIP())
+		tok, exp, err := backupTickets.issue(backupID, redact)
 		if err != nil {
 			if state != nil && state.Logger != nil {
 				state.Logger.Warn(fmt.Sprintf("[audit] 签发备份下载令牌被拒绝：id=%s redact=%v ip=%s reason=%s",
@@ -575,10 +570,10 @@ func DownloadSystemBackup(state *app.State) gin.HandlerFunc {
 			return
 		}
 
-		ticket, ok := backupTickets.consume(strings.TrimSpace(req.Token), backupID, c.ClientIP())
+		ticket, ok := backupTickets.consume(strings.TrimSpace(req.Token), backupID)
 		if !ok {
 			if state != nil && state.Logger != nil {
-				state.Logger.Warn(fmt.Sprintf("[audit] 备份下载被拒（令牌无效/过期/IP不匹配）：id=%s ip=%s", backupID, c.ClientIP()), "system")
+				state.Logger.Warn(fmt.Sprintf("[audit] 备份下载被拒（令牌无效/已过期/ID不匹配）：id=%s ip=%s", backupID, c.ClientIP()), "system")
 			}
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "下载凭证无效或已过期"})
 			return

@@ -243,23 +243,22 @@ func TestSystemOpsAuthBoundaryRateLimitAndSingleUseToken(t *testing.T) {
 		}
 	}
 
-	// 4. 换一个客户端 IP 尝试消费第 1 个 token → 必须 404 拒绝（且同时作废该 token）
+	// 4. 跨 backupID 使用第 1 个 token → 必须 404 拒绝（且同时作废该 token）
 	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/api/system/backups/"+createResp.Backup.ID+"/download", bytes.NewBufferString(`{"token":"`+issuedTokens[0]+`"}`))
+	req = httptest.NewRequest(http.MethodPost, "/api/system/backups/sniper-manual-20261122-000000-000000/download", bytes.NewBufferString(`{"token":"`+issuedTokens[0]+`"}`))
 	req.Header.Set("X-API-Key", masterKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.RemoteAddr = "10.0.0.2:54321"
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
-		t.Fatalf("token used from different IP must fail with 404, got %d", w.Code)
+		t.Fatalf("token used for mismatched backupID must fail with 404, got %d", w.Code)
 	}
 
-	// 5. 同 IP 使用第 2 个 token 下载成功且含安全头 + SQLite 魔数头
+	// 5. CDN 回源 IP 变化时携带合法主密钥 + 第 2 个一次性 token 仍可正常下载且含安全头 + SQLite 魔数头
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/system/backups/"+createResp.Backup.ID+"/download", bytes.NewBufferString(`{"token":"`+issuedTokens[1]+`"}`))
 	req.Header.Set("X-API-Key", masterKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.RemoteAddr = "10.0.0.1:12345"
+	req.RemoteAddr = "162.158.123.176:54321"
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("download returned %d: %s", w.Code, w.Body.String())

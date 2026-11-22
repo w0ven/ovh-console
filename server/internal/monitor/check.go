@@ -431,8 +431,8 @@ func (m *Monitor) CheckAvailabilityChange(sub *Subscription, traceID string) {
 	monitoredDCs := cfg.Datacenters
 	m.prepareMonitorTargets(sub, cfg, currentAvailability)
 
-	m.state.Logger.Info(fmt.Sprintf("订阅 %s - 监控数据中心: %v", planCode, monitoredDCs), "monitor")
-	m.state.Logger.Info(fmt.Sprintf("订阅 %s - 当前发现 %d 个配置组合", planCode, len(currentAvailability)), "monitor")
+	m.state.Logger.Debug(fmt.Sprintf("订阅 %s - 监控数据中心: %v", planCode, monitoredDCs), "monitor")
+	m.state.Logger.Debug(fmt.Sprintf("订阅 %s - 当前发现 %d 个配置组合", planCode, len(currentAvailability)), "monitor")
 
 	for configKey, configData := range currentAvailability {
 		if !m.checkCurrent(sub, cfg) {
@@ -466,7 +466,7 @@ func (m *Monitor) CheckAvailabilityChange(sub *Subscription, traceID string) {
 		configDisplay := memory + " + " + storage
 
 		configTraceID := uuid.NewString()
-		m.state.Logger.Info(fmt.Sprintf("检查配置: %s [config-trace:%s]", configDisplay, configTraceID), "monitor")
+		m.state.Logger.Debug(fmt.Sprintf("检查配置: %s [config-trace:%s]", configDisplay, configTraceID), "monitor")
 
 		configInfo := map[string]interface{}{
 			"memory":  memory,
