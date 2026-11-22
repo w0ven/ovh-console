@@ -196,6 +196,10 @@ type State struct {
 	MonitorRunning        bool
 	QueueProcessorRunning bool
 
+	// StartedAt 进程启动时间；Heartbeats 记录各后台循环纯内存心跳与健康状态（零写库放大）。
+	StartedAt  time.Time
+	Heartbeats *HeartbeatRegistry
+
 	// onProxyError 代理故障回调,由 main 接到 proxyguard。
 	onProxyError func(accountID string, err error)
 }
@@ -218,6 +222,8 @@ func NewState(paths storage.Paths, cfg *config.Store, lg *logger.Logger, sqliteD
 		VPSSubscriptions:      []types.VPSSubscription{},
 		VPSCheckInterval:      60,
 		QueueProcessorRunning: true,
+		StartedAt:             time.Now(),
+		Heartbeats:            NewHeartbeatRegistry(),
 	}
 	// Factory 闭包注入 lookup,允许按 id 查账户(空 id → 默认)
 	s.OVH = ovh.NewFactory(cfg, s.FindAccount)

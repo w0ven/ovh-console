@@ -78,7 +78,7 @@ func CheckServerAvailabilityWithConfigs(state *app.State, planCode string, accou
 	subsidiary := SubsidiaryOfAccount(acc)
 	region := ovh.SubsidiaryRegion(subsidiary)
 
-	state.Logger.Info(fmt.Sprintf("[配置监控] 查询 %s 的所有配置组合(%s 站点 / 子公司 %s)...", planCode, region, subsidiary), "monitor")
+	state.Logger.Debug(fmt.Sprintf("[配置监控] 查询 %s 的所有配置组合(%s 站点 / 子公司 %s)...", planCode, region, subsidiary), "monitor")
 
 	observation, err := state.StockSignals.Fetch(context.Background(), acc.ID, planCode, func() ([]map[string]interface{}, error) {
 		return ovh.GetAvailabilities(context.Background(), client, planCode)
@@ -99,7 +99,7 @@ func CheckServerAvailabilityWithConfigs(state *app.State, planCode string, accou
 		return map[string]*ConfigAvailability{}
 	}
 
-	state.Logger.Info(fmt.Sprintf("[配置监控] OVH API 返回 %d 个配置组合", len(availabilities)), "monitor")
+	state.Logger.Debug(fmt.Sprintf("[配置监控] OVH API 返回 %d 个配置组合", len(availabilities)), "monitor")
 
 	// addon 匹配用的目录走 2 小时内存缓存(公开数据,不耗账户配额)。
 	// 以前这里每次调用都用账户凭据现拉一份 ~10MB 的 eco 目录,而监控是
@@ -202,7 +202,7 @@ func CheckServerAvailabilityWithConfigs(state *app.State, planCode string, accou
 		}
 
 		if len(api2Options) > 0 {
-			state.Logger.Info(fmt.Sprintf("[配置监控] 成功提取 %d 个API2选项: %v", len(api2Options), api2Options), "monitor")
+			state.Logger.Debug(fmt.Sprintf("[配置监控] 成功提取 %d 个API2选项: %v", len(api2Options), api2Options), "monitor")
 		}
 
 		result[configKey] = &ConfigAvailability{
@@ -215,10 +215,10 @@ func CheckServerAvailabilityWithConfigs(state *app.State, planCode string, accou
 			CatalogMissing: catalogMissing,
 			OptionsNote:    optionsNote,
 		}
-		state.Logger.Info(fmt.Sprintf("[配置监控] 配置: %s + %s, 数据中心数: %d", memory, storage, len(datacenters)), "monitor")
+		state.Logger.Debug(fmt.Sprintf("[配置监控] 配置: %s + %s, 数据中心数: %d", memory, storage, len(datacenters)), "monitor")
 	}
 
-	state.Logger.Info(fmt.Sprintf("[配置监控] 成功获取 %d 个配置组合的可用性", len(result)), "monitor")
+	state.Logger.Debug(fmt.Sprintf("[配置监控] 成功获取 %d 个配置组合的可用性", len(result)), "monitor")
 	return result
 }
 

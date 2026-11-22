@@ -32,6 +32,26 @@ func DefaultWhitelist() map[string]struct{} {
 	}
 }
 
+// AppDeviceIDContextKey 保存已通过 App 配对设备令牌认证的设备 ID（gin.Context 键名常量，避免字符串漂移）。
+const AppDeviceIDContextKey = "app_device_id"
+
+// RequireMasterKey 拒绝通过 App 配对设备令牌（Authorization: Bearer）认证的请求，仅允许主密钥 X-API-Key 访问。
+// 用于整库备份导出、手动数据库空间整理及设备配对管理等高权限端点，确保单部手机丢失并吊销设备令牌的安全边界不被绕过。
+func RequireMasterKey() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if _, isDevice := c.Get(AppDeviceIDContextKey); isDevice {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"error":   "Forbidden for paired device token",
+				"message": "该操作仅允许使用主 API 密钥（网页控制台）执行，App 设备令牌无权访问",
+				"code":    "MASTER_KEY_REQUIRED",
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
 // Middleware Gin 中间件：验证 X-API-Key
 func Middleware(cfg Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -87,7 +107,7 @@ func Middleware(cfg Config) gin.HandlerFunc {
 				token := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 				if token != "" && cfg.DeviceTokenValid != nil {
 					if id, ok := cfg.DeviceTokenValid(token); ok {
-						c.Set("app_device_id", id)
+						c.Set(AppDeviceIDContextKey, id)
 						clearAuthFailures(c.ClientIP())
 						c.Next()
 						return

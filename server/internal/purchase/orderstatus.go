@@ -156,6 +156,12 @@ func OrderStatusLoop(state *app.State) {
 
 // OrderStatusLoopWithContext 支持通过 ctx 取消的订单状态后台刷新循环。
 func OrderStatusLoopWithContext(ctx context.Context, state *app.State) {
+	const intervalSec = 600
+	var epoch uint64
+	if state != nil && state.Heartbeats != nil {
+		epoch = state.Heartbeats.Register("order_status", intervalSec, true)
+		defer state.Heartbeats.SetStoppedIf("order_status", epoch)
+	}
 	// 启动先等一会,别和开机时的一堆 OVH 请求挤在一起
 	timer := time.NewTimer(90 * time.Second)
 	defer timer.Stop()
@@ -173,6 +179,9 @@ func OrderStatusLoopWithContext(ctx context.Context, state *app.State) {
 		}
 		if n := RefreshOrderStatusesWithContext(ctx, state, false); n > 0 {
 			state.Logger.Info(fmt.Sprintf("后台刷新订单状态:%d 条有变化", n), "purchase")
+		}
+		if state != nil && state.Heartbeats != nil {
+			state.Heartbeats.BeatOK("order_status", intervalSec)
 		}
 		select {
 		case <-ctx.Done():

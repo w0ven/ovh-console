@@ -877,11 +877,11 @@ func main() {
 		api.GET("/system/metrics", handlers.GetSystemMetrics(state))
 		api.GET("/version", handlers.GetVersion(state))
 
-		// App 配对体系:兑换在鉴权白名单(凭 2 分钟一次性码),管理端需要密钥
+		// App 配对体系:兑换在鉴权白名单(凭 2 分钟一次性码),管理端仅限主 API 密钥（防止被盗设备签发持久化后门新设备）
 		api.POST("/app/pair", handlers.RedeemPairingCode(state))
-		api.POST("/app/pairing-codes", handlers.CreatePairingCode(state))
-		api.GET("/app/devices", handlers.ListAppDevices(state))
-		api.DELETE("/app/devices/:id", handlers.RevokeAppDevice(state))
+		api.POST("/app/pairing-codes", auth.RequireMasterKey(), handlers.CreatePairingCode(state))
+		api.GET("/app/devices", auth.RequireMasterKey(), handlers.ListAppDevices(state))
+		api.DELETE("/app/devices/:id", auth.RequireMasterKey(), handlers.RevokeAppDevice(state))
 		api.GET("/version/check-update", handlers.CheckUpdate(state))
 		// 在线更新:下载 → 校验 → 替换自己 → 自动重启。gracefulRestart 在下面赋值,
 		// 这里用闭包间接引用,避免"路由要在 server 之前注册、server 又要在路由之后创建"的鸡生蛋
@@ -1150,6 +1150,18 @@ func main() {
 		api.POST("/ovh/contact-change-requests/:task_id/resend-email", handlers.ResendContactChangeEmail(state))
 		api.GET("/ovh/account/sub-accounts", handlers.GetSubAccounts(state))
 		api.GET("/ovh/account/bills", handlers.GetAccountBills(state))
+
+		// System health / DB maintenance / Backups（仅允许主密钥 X-API-Key，显式拒绝 App 配对设备令牌）
+		sysOps := api.Group("/system")
+		sysOps.Use(auth.RequireMasterKey())
+		{
+			sysOps.GET("/status", handlers.GetSystemStatus(state))
+			sysOps.POST("/db/maintain", handlers.MaintainDatabase(state))
+			sysOps.GET("/backups", handlers.ListSystemBackups(state))
+			sysOps.POST("/backups", handlers.CreateSystemBackup(state))
+			sysOps.POST("/backups/:id/download-token", handlers.IssueBackupDownloadToken(state))
+			sysOps.POST("/backups/:id/download", handlers.DownloadSystemBackup(state))
+		}
 	}
 
 	// 前端静态文件（仅 `-tags ui` 构建时生效）
@@ -1221,9 +1233,21 @@ func main() {
 	warmRegionDone := make(chan struct{})
 	cleanupPairingDone := make(chan struct{})
 	updateCheckDone := make(chan struct{})
+	dbMaintDone := make(chan struct{})
+	autoBackupDone := make(chan struct{})
 	pollerBootDone := make(chan struct{})
 	tgCmdBootDone := make(chan struct{})
-	registerBackgroundLoops(bgCancel, queueLoopDone, orderStatusDone, warmRegionDone, cleanupPairingDone, updateCheckDone, pollerBootDone, tgCmdBootDone)
+	registerBackgroundLoops(bgCancel, queueLoopDone, orderStatusDone, warmRegionDone, cleanupPairingDone, updateCheckDone, dbMaintDone, autoBackupDone, pollerBootDone, tgCmdBootDone)
+
+	// 预注册可选后台循环（仅在尚未存在时补建 stopped 记录，绝不覆盖已在运行的循环，且持锁读取 VPSCheckInterval）
+	if state.Heartbeats != nil {
+		state.VPSSubsMu.Lock()
+		vpsIv := state.VPSCheckInterval
+		state.VPSSubsMu.Unlock()
+		state.Heartbeats.RegisterIfAbsent("server_monitor", mon.CheckInterval(), false)
+		state.Heartbeats.RegisterIfAbsent("vps_monitor", vpsIv, false)
+		state.Heartbeats.RegisterIfAbsent("telegram_poller", telegram.PollTimeoutSeconds+20, false)
+	}
 
 	go func() {
 		defer close(queueLoopDone)
@@ -1268,6 +1292,20 @@ func main() {
 			return
 		}
 		handlers.StartUpdateCheckLoopWithContext(bgCtx, state)
+	}()
+	go func() {
+		defer close(dbMaintDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		handlers.StartDBMaintenanceLoopWithContext(bgCtx, state)
+	}()
+	go func() {
+		defer close(autoBackupDone)
+		if coord.isShutdownRequested() {
+			return
+		}
+		handlers.StartAutoBackupLoopWithContext(bgCtx, state)
 	}()
 
 	handlers.InitPoller(state, mon)

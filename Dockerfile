@@ -56,6 +56,9 @@ FROM alpine:3.23
 # su-exec：entrypoint 以 root 修完 /data 归属后用它降权
 RUN apk add --no-cache ca-certificates tzdata su-exec
 
+# 预建默认运行用户 10001:10001，兼容 read_only 根文件系统 + --user 10001:10001 强化模式
+RUN addgroup -g 10001 ovh && adduser -D -H -u 10001 -G ovh ovh
+
 COPY --from=gobuild /out/ovh-server /usr/local/bin/ovh-server
 
 # 启动脚本直接写在这里，不单独放一个文件 —— 它只服务于这个镜像，
@@ -81,31 +84,40 @@ if [ "$(id -u)" = "0" ]; then
   PUID="${PUID:-10001}"
   PGID="${PGID:-10001}"
 
-  # 组/用户可能已存在（重启同一个容器），存在就沿用
+  # 组/用户可能已存在（重启同一个容器），存在就沿用；非默认 PGID 时使用唯一组名避免与预建的 ovh:10001 冲突
   if ! getent group "$PGID" >/dev/null 2>&1; then
-    addgroup -g "$PGID" ovh 2>/dev/null || true
+    addgroup -g "$PGID" "ovh${PGID}" 2>/dev/null || true
   fi
   if ! getent passwd "$PUID" >/dev/null 2>&1; then
-    adduser -D -H -u "$PUID" -G "$(getent group "$PGID" | cut -d: -f1)" ovh 2>/dev/null || true
+    adduser -D -H -u "$PUID" -G "$(getent group "$PGID" | cut -d: -f1)" "ovh${PUID}" 2>/dev/null || true
   fi
 
   mkdir -p "$DATA"
   # 只在归属不对时才 chown：数据多了之后递归 chown 很慢，
-  # 每次启动都来一遍会让重启变成几十秒。
+  # 每次启动都来一遍会让重启变成几十秒。使用 -h 不跟随软链，防止被软链提权改写镜像系统路径。
   CURRENT_UID="$(stat -c %u "$DATA" 2>/dev/null || echo -1)"
   if [ "$CURRENT_UID" != "$PUID" ]; then
     echo "[entrypoint] 把 $DATA 的归属改成 $PUID:$PGID（首次挂载或 PUID 变了）"
-    chown -R "$PUID:$PGID" "$DATA" || {
+    chown -R -h "$PUID:$PGID" "$DATA" || {
       echo "[entrypoint] ⚠️ chown 失败。如果 $DATA 是只读挂载或网络文件系统，"
       echo "[entrypoint]    请改用 docker run --user $(id -u):$(id -g)，或把宿主目录 chown 成 $PUID:$PGID"
     }
   fi
+  # 拒绝 symlink / 非目录占位，防止 root 跟随链接改写容器内任意路径
+  if [ -L "$DATA/tmp" ] || { [ -e "$DATA/tmp" ] && [ ! -d "$DATA/tmp" ]; }; then
+    echo "[entrypoint] ⚠️ $DATA/tmp 不是普通目录（可能是符号链接），已移除重建"
+    rm -f "$DATA/tmp"
+  fi
+  mkdir -p "$DATA/tmp"
+  chown -h "$PUID:$PGID" "$DATA/tmp" 2>/dev/null || true
+  chmod 700 "$DATA/tmp" 2>/dev/null || true
 
   exec su-exec "$PUID:$PGID" "$APP" "$@"
 fi
 
 # 已经是非 root（用了 --user）：不做任何归属处理，直接跑。
 # 这时候宿主目录的写权限得由调用方保证 —— 我们没有能力改。
+mkdir -p "$DATA/tmp" 2>/dev/null || true
 if [ ! -w "$DATA" ]; then
   echo "[entrypoint] ⚠️ $DATA 当前用户($(id -u):$(id -g))写不进去。"
   echo "[entrypoint]    数据库、加密密钥、日志都要写在这里，起不来是必然的。"
@@ -118,6 +130,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # 所有持久化数据都在这一个目录下：SQLite、缓存、日志。
 # 一个卷就够，不需要分别挂。
 ENV DATA_DIR=/data
+ENV SQLITE_TMPDIR=/data/tmp
 
 # ⚠️ 这一行很关键，不要删。
 #

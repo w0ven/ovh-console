@@ -252,7 +252,7 @@ func checkVPSDCAvailabilityContext(ctx context.Context, state *app.State, planCo
 	}
 	fullURL := u + "?" + params.Encode()
 
-	state.Logger.Info(fmt.Sprintf("检查VPS可用性: %s (subsidiary: %s, 站点: %s)", planCode, sub, RegionLabel(region)), "vps_monitor")
+	state.Logger.Debug(fmt.Sprintf("检查VPS可用性: %s (subsidiary: %s, 站点: %s)", planCode, sub, RegionLabel(region)), "vps_monitor")
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	req.Header.Set("accept", "application/json")
@@ -293,7 +293,7 @@ func checkVPSDCAvailabilityContext(ctx context.Context, state *app.State, planCo
 		// 200 但没有 datacenters 字段:结构变了,别当成"无货"吞掉
 		return nil, &CheckError{Msg: fmt.Sprintf("%s 返回里没有 datacenters 字段: %s", RegionLabel(region), bodySnippet(body)), Retryable: true}
 	}
-	state.Logger.Info("VPS "+planCode+" 数据中心信息获取成功 ("+sub+")", "vps_monitor")
+	state.Logger.Debug("VPS "+planCode+" 数据中心信息获取成功 ("+sub+")", "vps_monitor")
 	return data, nil
 }
 
@@ -360,7 +360,7 @@ func SaveSubscriptions(state *app.State) error {
 		state.Logger.Error("保存VPS检查间隔时出错: "+err.Error(), "")
 		return err
 	}
-	state.Logger.Info(fmt.Sprintf("已保存 %d 个VPS订阅", len(subs)), "")
+	state.Logger.Debug(fmt.Sprintf("已保存 %d 个VPS订阅", len(subs)), "")
 	return nil
 }
 
@@ -473,8 +473,17 @@ func stillMine(gen int64) bool {
 }
 
 func monitorLoopGen(ctx context.Context, state *app.State, gen int64) {
+	var epoch uint64
+	if state != nil && state.Heartbeats != nil {
+		state.VPSSubsMu.Lock()
+		iv := state.VPSCheckInterval
+		state.VPSSubsMu.Unlock()
+		epoch = state.Heartbeats.Register("vps_monitor", iv, true)
+		defer state.Heartbeats.SetStoppedIf("vps_monitor", epoch)
+	}
 	state.Logger.Info("VPS监控循环已启动", "vps_monitor")
 	for {
+		roundStart := time.Now()
 		isRunning := stillMine(gen)
 		if !isRunning {
 			break
@@ -491,7 +500,7 @@ func monitorLoopGen(ctx context.Context, state *app.State, gen int64) {
 		state.VPSSubsMu.Unlock()
 
 		if len(subs) > 0 {
-			state.Logger.Info(fmt.Sprintf("开始检查 %d 个VPS订阅...", len(subs)), "vps_monitor")
+			state.Logger.Debug(fmt.Sprintf("开始检查 %d 个VPS订阅...", len(subs)), "vps_monitor")
 			for idx := range subs {
 				isRunning = stillMine(gen)
 				if !isRunning {
@@ -500,12 +509,16 @@ func monitorLoopGen(ctx context.Context, state *app.State, gen int64) {
 				checkSubscription(ctx, state, gen, &subs[idx])
 			}
 		} else {
-			state.Logger.Info("当前无VPS订阅，跳过检查", "vps_monitor")
+			state.Logger.Debug("当前无VPS订阅，跳过检查", "vps_monitor")
+		}
+		if state.Heartbeats != nil {
+			effectiveSec := interval + int(time.Since(roundStart).Seconds())
+			state.Heartbeats.BeatOK("vps_monitor", effectiveSec)
 		}
 
 		isRunning = stillMine(gen)
 		if isRunning {
-			state.Logger.Info(fmt.Sprintf("等待 %d 秒后进行下次VPS检查...", interval), "vps_monitor")
+			state.Logger.Debug(fmt.Sprintf("等待 %d 秒后进行下次VPS检查...", interval), "vps_monitor")
 			for i := 0; i < interval; i++ {
 				isRunning = stillMine(gen)
 				if !isRunning {

@@ -77,9 +77,9 @@ func (m *Monitor) CheckNewServers(currentServerList []map[string]interface{}) {
 
 func (m *Monitor) runSubscriptionCheck(sub *Subscription, traceID string) {
 	planCode := sub.PlanCode
-	m.state.Logger.Info("开始处理订阅: "+planCode, "monitor")
+	m.state.Logger.Debug("开始处理订阅: "+planCode, "monitor")
 	m.CheckAvailabilityChange(sub, traceID)
-	m.state.Logger.Info("完成处理订阅: "+planCode, "monitor")
+	m.state.Logger.Debug("完成处理订阅: "+planCode, "monitor")
 }
 
 // stillMine 这个循环该不该继续:running 为真且代际号还是自己那一代
@@ -90,6 +90,11 @@ func (m *Monitor) stillMine(gen int64) bool {
 }
 
 func (m *Monitor) monitorLoopGen(gen int64) {
+	var epoch uint64
+	if m.state != nil && m.state.Heartbeats != nil {
+		epoch = m.state.Heartbeats.Register("server_monitor", m.CheckInterval(), true)
+		defer m.state.Heartbeats.SetStoppedIf("server_monitor", epoch)
+	}
 	m.state.Logger.Info("监控循环已启动", "monitor")
 	for {
 		roundStart := time.Now()
@@ -111,7 +116,7 @@ func (m *Monitor) monitorLoopGen(gen int64) {
 		m.subsMu.Unlock()
 
 		if count > 0 {
-			m.state.Logger.Info(fmt.Sprintf("开始检查 %d 个订阅...", count), "monitor")
+			m.state.Logger.Debug(fmt.Sprintf("开始检查 %d 个订阅...", count), "monitor")
 			workers := m.maxWorkers
 			if count < workers {
 				workers = count
@@ -159,7 +164,11 @@ func (m *Monitor) monitorLoopGen(gen int64) {
 				m.SaveToDB()
 			}
 		} else {
-			m.state.Logger.Info("当前无订阅，跳过检查", "monitor")
+			m.state.Logger.Debug("当前无订阅，跳过检查", "monitor")
+		}
+		if m.state.Heartbeats != nil {
+			effectiveSec := m.CheckInterval() + int(time.Since(roundStart).Seconds())
+			m.state.Heartbeats.BeatOK("server_monitor", effectiveSec)
 		}
 
 		// 按轮次起点计时,不再把网络/验价耗时额外加到检查间隔上。

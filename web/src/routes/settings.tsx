@@ -3,6 +3,7 @@ import { Settings as SettingsIcon, KeyRound, Globe, Send, Database, Save, AlertT
 import { useTheme } from "@/hooks/use-theme";
 import { Section } from "@/routes/settings-sections";
 import { AppPairingSection } from "@/components/settings/AppPairingSection";
+import { SystemStatusSection } from "@/components/settings/SystemStatusSection";
 import { Smartphone } from "lucide-react";
 import type { ThemeMode } from "@/lib/theme";
 import { useEffect, useState } from "react";
@@ -79,6 +80,7 @@ const SECTIONS = [
   { id: "notify", icon: BellRing, label: "settings.sections.notify" },
   { id: "app", icon: Smartphone, label: "settings.sections.app" },
   { id: "cache", icon: Database, label: "settings.sections.cache" },
+  { id: "system", icon: Activity, label: "settings.sections.system" },
 ] as const;
 
 function SettingsPage() {
@@ -210,7 +212,7 @@ function SettingsPage() {
           <CardContent className="p-3 sm:p-6">
             {cfg.isPending ? (
               <Skeleton className="h-64 rounded-2xl" />
-            ) : cfg.isError && active !== "password" && active !== "appearance" && active !== "app" && active !== "accounts" && active !== "cache" ? (
+            ) : cfg.isError && active !== "password" && active !== "appearance" && active !== "app" && active !== "accounts" && active !== "cache" && active !== "system" ? (
               // 配置读失败时,Telegram / 通知通道那些输入框会全渲染成空 ——
               // 看上去就是"你还没配过",而实际上后端存着真实配置。
               // 在这里直接换成失败态,顺便挡住"照着空表单点保存"这条把配置删干净的路。
@@ -244,6 +246,8 @@ function SettingsPage() {
               <NotifySection form={form} set={set} />
             ) : active === "purchase" ? (
               <PurchaseSection form={form} set={set} />
+            ) : active === "system" ? (
+              <SystemStatusSection />
             ) : (
               <CacheSection />
             )}

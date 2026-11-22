@@ -186,7 +186,7 @@ func (m *Monitor) SaveToDB() error {
 		m.state.Logger.Warn("保存检查间隔失败: "+err.Error(), "monitor")
 		return err
 	}
-	m.state.Logger.Info(fmt.Sprintf("订阅数据已保存(检查间隔 %d 秒)", interval), "monitor")
+	m.state.Logger.Debug(fmt.Sprintf("订阅数据已保存(检查间隔 %d 秒)", interval), "monitor")
 	return nil
 }
 

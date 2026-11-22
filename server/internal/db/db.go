@@ -199,6 +199,10 @@ func (db *DB) migrate() error {
 	if err := db.addColumnIfMissing("telegram_order_buttons", "account_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	// catalogs.content_hash: 内容去重哈希，避免每 2 小时目录刷新在内容未变时重写 ~12MB 大行导致 SQLite 空闲页暴涨。
+	if err := db.addColumnIfMissing("catalogs", "content_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 

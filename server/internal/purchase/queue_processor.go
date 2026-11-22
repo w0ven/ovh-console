@@ -129,6 +129,11 @@ func processQueueLoop(loopCtx context.Context, state *app.State, purchase func(c
 	sales := newSaleWatcher(ctx, state)
 	stocks := newStockWatcher(ctx, state)
 	var wg sync.WaitGroup
+	var epoch uint64
+	if state != nil && state.Heartbeats != nil {
+		epoch = state.Heartbeats.Register("queue_processor", 15, true)
+		defer state.Heartbeats.SetStoppedIf("queue_processor", epoch)
+	}
 	defer func() { cancel(); sales.close(); stocks.close(); wg.Wait() }()
 	wg.Add(1)
 	go func() { defer wg.Done(); transportWarmLoop(ctx, state) }()
@@ -140,7 +145,12 @@ func processQueueLoop(loopCtx context.Context, state *app.State, purchase func(c
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	nextRestore := time.Time{}
+	nextBeat := time.Time{}
 	for ctx.Err() == nil {
+		if state != nil && state.Heartbeats != nil && !time.Now().Before(nextBeat) {
+			state.Heartbeats.BeatOK("queue_processor", 15)
+			nextBeat = time.Now().Add(5 * time.Second)
+		}
 		if state.SaveBlocked("history") == nil && state.SaveBlocked("queue") == nil {
 			if !time.Now().Before(nextRestore) {
 				if err := state.RestoreCompletedQueue(); err != nil {

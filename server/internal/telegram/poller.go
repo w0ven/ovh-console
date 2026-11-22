@@ -227,6 +227,11 @@ func (p *Poller) stillMine(gen int64) bool {
 }
 
 func (p *Poller) loop(gen int64) {
+	var epoch uint64
+	if p.state != nil && p.state.Heartbeats != nil {
+		epoch = p.state.Heartbeats.Register("telegram_poller", PollTimeoutSeconds+20, true)
+		defer p.state.Heartbeats.SetStoppedIf("telegram_poller", epoch)
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			p.state.Logger.Error(fmt.Sprintf("长轮询循环异常退出: %v", r), "telegram")
@@ -250,6 +255,9 @@ func (p *Poller) loop(gen int64) {
 			}
 			fails++
 			p.lastErr.Store(err.Error())
+			if p.state != nil && p.state.Heartbeats != nil {
+				p.state.Heartbeats.BeatError("telegram_poller", PollTimeoutSeconds+20, err.Error())
+			}
 			d := pollBackoff[min(fails-1, len(pollBackoff)-1)]
 			// 409 = 另一个进程在用同一个 token 拉 update。
 			// 两个实例互相踢,表现是按钮时灵时不灵,值得单独喊一声。
@@ -268,6 +276,9 @@ func (p *Poller) loop(gen int64) {
 			p.lastErr.Store("")
 		}
 		p.lastPoll.Store(time.Now())
+		if p.state != nil && p.state.Heartbeats != nil {
+			p.state.Heartbeats.BeatOK("telegram_poller", PollTimeoutSeconds+20)
+		}
 
 		for _, up := range updates {
 			if !p.stillMine(gen) {

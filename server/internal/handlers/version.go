@@ -3,8 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/ovh-buy/server/internal/app"
+	"github.com/ovh-buy/server/internal/notify"
 	"github.com/ovh-buy/server/internal/updater"
 )
 
@@ -33,11 +36,186 @@ func GetVersion(state *app.State) gin.HandlerFunc {
 // 这里不再另存一份 —— 两处各写一份的话,换源时漏改一边就会出现"检查到的版本"和
 // "实际装上的版本"不是同一个的诡异现象。
 const (
-	updateUserAgent      = "OVH-Console-UpdateChecker"
-	updateCacheSuccessTT = 15 * time.Minute
-	updateCacheFailureTT = 60 * time.Second
-	updatePollInterval   = 5 * time.Minute
+	updateUserAgent         = "OVH-Console-UpdateChecker"
+	updateCacheSuccessTT    = 15 * time.Minute
+	updateCacheFailureTT    = 60 * time.Second
+	updatePollInterval      = 5 * time.Minute
+	kvUpdateLastNotifiedTag = "update_last_notified_tag"
+	updateNotifyMaxBackoff  = 6 * time.Hour
 )
+
+// updateNotifyBroadcastFn 与 updateNotifyAnyAvailableFn 允许测试注入无外网桩；生产环境直接走 notify 包。
+var (
+	updateNotifyBroadcastFn    = notify.BroadcastWithStatus
+	updateNotifyAnyAvailableFn = notify.AnyAvailable
+	updateNotifyNowFn          = time.Now
+	updateNotifyMu             sync.Mutex
+	updateNotifyMemNotifiedTag string
+	updateNotifyFailTag        string
+	updateNotifyFailCount      int
+	updateNotifyNextAttemptAt  time.Time
+)
+
+func resetUpdateNotifyStateForTest() {
+	updateNotifyMu.Lock()
+	updateNotifyMemNotifiedTag = ""
+	updateNotifyFailTag = ""
+	updateNotifyFailCount = 0
+	updateNotifyNextAttemptAt = time.Time{}
+	updateNotifyMu.Unlock()
+}
+
+// sanitizeReleaseBodyPlainText 剥离外部 Release body 中的 HTML 标签和控制字符并截断，确保纯文本安全展示。
+func sanitizeReleaseBodyPlainText(raw string, maxRunes int) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	var out strings.Builder
+	inTag := false
+	for _, r := range s {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			if inTag {
+				inTag = false
+				continue
+			}
+		}
+		if inTag {
+			continue
+		}
+		if r < 32 && r != '\n' && r != '\t' {
+			continue
+		}
+		out.WriteRune(r)
+	}
+	clean := strings.TrimSpace(out.String())
+	runes := []rune(clean)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		clean = string(runes[:maxRunes]) + "…"
+	}
+	return clean
+}
+
+// isTrustedReleaseURL 仅允许官方仓库 https://github.com/<Repo>/releases/... 链接出现在通知中，防止第三方镜像钓鱼。
+func isTrustedReleaseURL(u string) bool {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return false
+	}
+	prefix := "https://github.com/" + updater.Repo + "/releases/"
+	return strings.HasPrefix(u, prefix)
+}
+
+// formatUpdateNotifyMessage 构造简洁清晰的纯文本新版本通知文案（按容器/裸机区分升级动作）。
+func formatUpdateNotifyMessage(current, latest, tag, relURL, body string, inContainer bool) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("🆕 OVH 控制台发现新版本：v%s → %s\n", strings.TrimPrefix(current, "v"), tag))
+	if summary := sanitizeReleaseBodyPlainText(body, 400); summary != "" {
+		b.WriteString("\n更新说明：\n")
+		b.WriteString(summary)
+		b.WriteString("\n")
+	}
+	if isTrustedReleaseURL(relURL) {
+		b.WriteString("\n发布页：")
+		b.WriteString(strings.TrimSpace(relURL))
+		b.WriteString("\n")
+	}
+	if inContainer {
+		b.WriteString("\n容器升级命令：\ndocker compose pull && docker compose up -d")
+	} else {
+		b.WriteString("\n可在 Web 控制台右上角点击版本入口查看并更新。")
+	}
+	return b.String()
+}
+
+// maybeNotifyNewRelease 按“状态驱动”规则决定是否发送新版本通知：
+//   - 无论本次结果来自新 200、304 复用还是已有缓存快照，只要满足 Version != "dev"、非 prerelease/draft、
+//     semverGreater(latest, Version) 且未通知过该 tag，即触发检查；
+//   - 若用户未配置任何通知通道，静默跳过；
+//   - 若发送全部失败，按指数退避（5m → 10m → 20m … 上限 6h）避免重试风暴；
+//   - 只要至少 1 个通道实际送达成功（sent > 0），立即在内存和 SQLite kv 中记为已通知（即使 SetKV 失败，本进程也不重复刷屏）。
+var strictReleaseTagRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+$`)
+
+func maybeNotifyNewRelease(state *app.State, res updateCheckResult) bool {
+	if state == nil || state.DB == nil || !res.ok {
+		return false
+	}
+	tag := strings.TrimSpace(res.release.TagName)
+	if tag == "" || !strictReleaseTagRe.MatchString(tag) || res.release.Prerelease || res.release.Draft {
+		return false
+	}
+	latest := strings.TrimPrefix(tag, "v")
+	if Version == "dev" || !semverGreater(latest, Version) {
+		return false
+	}
+
+	updateNotifyMu.Lock()
+	defer updateNotifyMu.Unlock()
+
+	if updateNotifyMemNotifiedTag == tag {
+		return false
+	}
+	var lastNotified string
+	if ok, err := state.DB.GetKV(kvUpdateLastNotifiedTag, &lastNotified); err == nil && ok {
+		if strings.TrimSpace(lastNotified) == tag {
+			updateNotifyMemNotifiedTag = tag
+			return false
+		}
+	}
+
+	now := updateNotifyNowFn()
+	if updateNotifyFailTag == tag && now.Before(updateNotifyNextAttemptAt) {
+		return false
+	}
+
+	avail, _ := updateNotifyAnyAvailableFn(state, false)
+	if !avail {
+		return false
+	}
+
+	msg := formatUpdateNotifyMessage(Version, latest, tag, res.release.HTMLURL, res.release.Body, updater.InContainer())
+	sent, _ := updateNotifyBroadcastFn(state, msg, nil)
+	if sent <= 0 {
+		if updateNotifyFailTag != tag {
+			updateNotifyFailTag = tag
+			updateNotifyFailCount = 1
+		} else {
+			updateNotifyFailCount++
+		}
+		shift := updateNotifyFailCount - 1
+		if shift > 8 {
+			shift = 8
+		}
+		backoff := updatePollInterval * time.Duration(1<<shift)
+		if backoff > updateNotifyMaxBackoff {
+			backoff = updateNotifyMaxBackoff
+		}
+		updateNotifyNextAttemptAt = now.Add(backoff)
+		if state.Logger != nil {
+			state.Logger.Warn(fmt.Sprintf("新版本 %s 通知未成功送达任何通道，将在 %s 后重试", tag, backoff), "version")
+		}
+		return false
+	}
+
+	// 只要已成功送达，先落内存去重，防止 SetKV 瞬时失败引发每 5 分钟重复推送
+	updateNotifyMemNotifiedTag = tag
+	updateNotifyFailTag = ""
+	updateNotifyFailCount = 0
+	updateNotifyNextAttemptAt = time.Time{}
+
+	if err := state.DB.SetKV(kvUpdateLastNotifiedTag, tag); err != nil {
+		if state.Logger != nil {
+			state.Logger.Warn("记录已通知版本标签失败（已在内存去重）: "+err.Error(), "version")
+		}
+	} else if state.Logger != nil {
+		state.Logger.Info(fmt.Sprintf("已通过 %d 个通道推送新版本通知: %s", sent, tag), "version")
+	}
+	return true
+}
 
 // githubRelease 只挑要用的字段反序列化
 type githubRelease struct {
@@ -280,8 +458,15 @@ func fetchLatestReleaseFromUpstream(parentCtx context.Context, url string, state
 }
 
 // StartUpdateCheckLoopWithContext 仿照 OpenBear 更新策略，后台按 5 分钟周期（携带 If-None-Match ETag 条件请求）
-// 探测最新 Release，缓存热数据供前端秒开读取；将服务生命周期 ctx 传入上游 HTTP 以在退出时即时中止在途请求。
+// 探测最新 Release，缓存热数据供前端秒开读取，并在发现未通知过的新正式版本时主动推送通知；
+// 将服务生命周期 ctx 传入上游 HTTP 以在退出时即时中止在途请求。
 func StartUpdateCheckLoopWithContext(ctx context.Context, state *app.State) {
+	pollSec := int(updatePollInterval.Seconds())
+	var epoch uint64
+	if state != nil && state.Heartbeats != nil {
+		epoch = state.Heartbeats.Register("update_check", pollSec, true)
+		defer state.Heartbeats.SetStoppedIf("update_check", epoch)
+	}
 	// 启动稍作延迟，避免和初始化阶段的 OVH 请求撞在一起
 	initTimer := time.NewTimer(15 * time.Second)
 	defer initTimer.Stop()
@@ -296,7 +481,27 @@ func StartUpdateCheckLoopWithContext(ctx context.Context, state *app.State) {
 			return
 		}
 		url := updater.LatestReleaseURL()
-		_, _ = releaseCheckCache.fetch(ctx, ctx, url, state, true)
+		res, ok := releaseCheckCache.fetch(ctx, ctx, url, state, true)
+		if !ok {
+			if ctx.Err() == nil && state != nil && state.Heartbeats != nil {
+				state.Heartbeats.BeatError("update_check", pollSec, "更新检查请求被取消或超时")
+			}
+			return
+		}
+		if state != nil && state.Heartbeats != nil {
+			if res.ok && res.lastError == "" {
+				state.Heartbeats.BeatOK("update_check", pollSec)
+			} else {
+				errMsg := res.errMsg
+				if errMsg == "" {
+					errMsg = res.lastError
+				}
+				state.Heartbeats.BeatError("update_check", pollSec, errMsg)
+			}
+		}
+		if res.ok {
+			maybeNotifyNewRelease(state, res)
+		}
 	}
 
 	runCheck()
