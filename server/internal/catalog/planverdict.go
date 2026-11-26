@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/ovh-buy/server/internal/app"
@@ -122,4 +123,105 @@ func ClassifyPlan(state *app.State, accountID, planCode, logSource string) (Plan
 			"Scale / HCI / SDS / High-Grade 这些产品线都不走 Eco（实测欧区 244 个有库存的机型里 145 个如此）。"+
 			"本工具的下单链路只有 /order/cart/eco 一条，买不了这台，请到 OVH 官网下单。",
 		planCode, accRegion, subsidiary)
+}
+
+// DatacenterVerdict 判定目标机房是否属于某 (账户子公司, planCode) 的销售目录。
+//
+// 为什么必须与"当前无库存"区分:OVH 在 summary / checkout 阶段对以下两种截然不同的场景
+// 返回完全同一句 400 报错 "<fqn> is not available in <dc>":
+//  1. 机房就在本子公司目录里(如 IE 的 27skle06-v1 含 fra/lon),但结账瞬间库存已被抢空;
+//  2. 机房根本不在该子公司该机型的目录里(如在 IE 区填了美区 hil,或只卖 sgp 的机型填了 gra)。
+type DatacenterVerdict int
+
+const (
+	// DatacenterVerdictUnknown 目录暂不可用、机型尚未进公开目录、或目录未声明机房列表 —— 不妄下定论。
+	DatacenterVerdictUnknown DatacenterVerdict = iota
+	// DatacenterVerdictInCatalog 目标机房明确属于该 (账户子公司, planCode) 目录的可选机房列表。
+	DatacenterVerdictInCatalog
+	// DatacenterVerdictOutOfCatalog 目录已给出该机型的非空可选机房列表,且刷新短缓存后仍不包含目标机房。
+	DatacenterVerdictOutOfCatalog
+)
+
+// ClassifyDatacenter 判定 datacenter 是否在该账户所属子公司的 planCode 目录里,并返回目录中的可选机房列表。
+func ClassifyDatacenter(state *app.State, accountID, planCode, datacenter string) (DatacenterVerdict, []string) {
+	if state == nil {
+		return DatacenterVerdictUnknown, nil
+	}
+	acc, _ := state.FindAccount(accountID)
+	return ClassifyDatacenterInSubsidiary(state, SubsidiaryOfAccount(acc), planCode, datacenter)
+}
+
+// ClassifyDatacenterInSubsidiary 按指定子公司(与实际建车的 orderSubsidiary 口径一致)判定机房是否属于该型号目录:
+//  1. 命中 2 小时缓存的合法机房直接返回 InCatalog(0 网络请求);
+//  2. 型号不在目录或机房列表为空直接返回 Unknown(不触发 15 秒短 TTL 目录刷新,避免无意义拉取 12MB 目录);
+//  3. 仅当"型号在目录、机房列表非空、但目标机房不在列表"时按短 TTL 刷新核实一次,且必须确认拿到的是刚刷新的新目录
+//     (而非刷新失败时的旧目录兜底)才允许返回 OutOfCatalog,防止目录接口瞬断时误判。
+func ClassifyDatacenterInSubsidiary(state *app.State, subsidiary, planCode, datacenter string) (DatacenterVerdict, []string) {
+	subsidiary = strings.ToUpper(strings.TrimSpace(subsidiary))
+	planCode = strings.TrimSpace(planCode)
+	datacenter = strings.TrimSpace(datacenter)
+	if state == nil || subsidiary == "" || planCode == "" || datacenter == "" {
+		return DatacenterVerdictUnknown, nil
+	}
+	cat, err := loadSubsidiaryCatalog(state, subsidiary)
+	if err != nil {
+		return DatacenterVerdictUnknown, nil
+	}
+	pc, ok := cat.plans[planCode]
+	if !ok || len(pc.datacenters) == 0 {
+		return DatacenterVerdictUnknown, nil
+	}
+	if datacenterInList(pc.datacenters, datacenter) {
+		return DatacenterVerdictInCatalog, append([]string(nil), pc.datacenters...)
+	}
+	// 仅在型号已存在且机房列表非空但未命中时,用短 TTL 刷新核实是否刚扩充了新机房。
+	cat, err = loadSubsidiaryCatalogWithTTL(state, subsidiary, PreorderCheckInterval)
+	if err != nil {
+		return DatacenterVerdictUnknown, nil
+	}
+	pc, ok = cat.plans[planCode]
+	if !ok || len(pc.datacenters) == 0 {
+		return DatacenterVerdictUnknown, nil
+	}
+	dcs := append([]string(nil), pc.datacenters...)
+	if datacenterInList(dcs, datacenter) {
+		return DatacenterVerdictInCatalog, dcs
+	}
+	// loadSubsidiaryCatalogWithTTL 在远端 5xx/超时且存在旧缓存时会返回 stale 目录且 err == nil;
+	// 此时不能拿过期旧目录断言 OutOfCatalog,必须确认目录确实在短 TTL 窗口内刷新成功。
+	if time.Since(cat.fetchedAt) > PreorderCheckInterval {
+		return DatacenterVerdictUnknown, nil
+	}
+	return DatacenterVerdictOutOfCatalog, dcs
+}
+
+func datacenterInList(dcs []string, target string) bool {
+	raw := strings.TrimSpace(target)
+	if raw == "" {
+		return false
+	}
+	want := ovh.ConvertDisplayDCToAPIDC(raw)
+	for _, dc := range dcs {
+		trimmed := strings.TrimSpace(dc)
+		if trimmed == "" {
+			continue
+		}
+		if strings.EqualFold(trimmed, raw) || strings.EqualFold(ovh.ConvertDisplayDCToAPIDC(trimmed), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// FormatOutOfCatalogDatacenterMessage 构造"机房确实不在本子公司目录"的统一诊断说明。
+func FormatOutOfCatalogDatacenterMessage(subsidiary, planCode, datacenter string, catalogDCs []string) string {
+	dcLabel := strings.ToUpper(strings.TrimSpace(datacenter))
+	sub := strings.ToUpper(strings.TrimSpace(subsidiary))
+	region := ovh.SubsidiaryRegion(sub)
+	if len(catalogDCs) > 0 {
+		return fmt.Sprintf("机房 %s 不在子公司 %s（%s 区）的 %s 目录里（该机型在本区可选机房：%s；OVH 三站目录独立，同一机型在不同区可选的机房不同，请改选本区支持的机房或切换对应区账户）",
+			dcLabel, sub, region, planCode, strings.Join(catalogDCs, ", "))
+	}
+	return fmt.Sprintf("机房 %s 不在子公司 %s（%s 区）的 %s 目录里；OVH 三站目录独立，同一机型在不同区可选的机房不同",
+		dcLabel, sub, region, planCode)
 }

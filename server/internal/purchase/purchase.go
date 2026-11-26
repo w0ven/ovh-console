@@ -297,6 +297,16 @@ func PurchaseServer(ctx context.Context, state *app.State, item *types.QueueItem
 		}
 		// 没有该配置/机房时不能猜配置造车;目录未上架仍按原逻辑等待。
 		if availableFQN == "" {
+			if !item.Preorder {
+				sub := orderSubsidiary(state, session.account, "purchase")
+				if verdict, dcs := catalog.ClassifyDatacenterInSubsidiary(state, sub, item.PlanCode, apiDC); verdict == catalog.DatacenterVerdictOutOfCatalog {
+					msg := catalog.FormatOutOfCatalogDatacenterMessage(sub, item.PlanCode, apiDC, dcs)
+					state.Logger.Error(msg, "purchase")
+					recordTiming(timingKey, tl, "failed")
+					recordFailure(state, item, msg)
+					return Outcome{Fatal: true, Attempted: true, Reason: msg}
+				}
+			}
 			recordTiming(timingKey, tl, "unavailable")
 			return Outcome{WaitingForStock: true}
 		}
@@ -439,18 +449,20 @@ func PurchaseServer(ctx context.Context, state *app.State, item *types.QueueItem
 		// POST /item/{id}/configuration 对取值不做任何校验 —— 实测在 EU 车上把
 		// dedicated_datacenter 设成 "hil"、region 设成 "usa" 都会 200 返回配置项 id,
 		// 直到 summary/checkout 才报 "<fqn> is not available in hil"。
-		// 也就是说"配置全设成功"根本不代表值合法,错的机房/区域只能在这里现原形,
-		// 必须把它翻成用户看得懂的话,否则历史里只有一句英文 OVH 报错。
-		// 用 Explain 而不是 err.Error():这条是用户在「购买历史」里唯一能看到的说明。
-		// Explain 把原文原样嵌在后面,所以下面那句 Contains 判断照样成立。
+		// 但 OVH 在目录内机房结账瞬间库存归零(被他人抢空)时也返回完全同一句
+		// "<fqn> is not available in fra" —— 必须结合本子公司目录区分"目录内售罄"与"真跨区/目录外机房"。
 		errMsg := ovh.Explain(err)
-		if strings.Contains(errMsg, "is not available in") {
-			errMsg = fmt.Sprintf("%s（机房 %s 不在子公司 %s 的 %s 目录里；OVH 三站目录独立，同一机型在不同区可选的机房不同）",
-				errMsg, apiDC, subsidiary, item.PlanCode)
+		dcVerdict := catalog.DatacenterVerdictUnknown
+		if !item.Preorder && !checkoutUncertain(err) && ovh.IsNotAvailableInDatacenter(err) {
+			errMsg, dcVerdict = explainNotAvailableInDC(state, item, subsidiary, apiDC, "结账瞬间", err)
 		}
 		tl.mark("下单")
 		recordTiming(timingKey, tl, "failed")
-		state.Logger.Error(fmt.Sprintf("购买 %s 时发生 OVH API 错误: %s (%s)", item.PlanCode, errMsg, tl.String()), "purchase")
+		if dcVerdict == catalog.DatacenterVerdictInCatalog {
+			state.Logger.Warn(fmt.Sprintf("抢购 %s@%s 结账瞬间库存已售罄: %s (%s)", item.PlanCode, apiDC, errMsg, tl.String()), "purchase")
+		} else {
+			state.Logger.Error(fmt.Sprintf("购买 %s 时发生 OVH API 错误: %s (%s)", item.PlanCode, errMsg, tl.String()), "purchase")
+		}
 		if couponWarning != "" {
 			errMsg += "；" + couponWarning
 		}
@@ -478,6 +490,23 @@ func PurchaseServer(ctx context.Context, state *app.State, item *types.QueueItem
 			return Outcome{WaitingForCatalog: true, Reason: errMsg}
 		}
 		recordFailure(state, item, errMsg)
+		switch dcVerdict {
+		case catalog.DatacenterVerdictInCatalog:
+			// 机房明确属于本子公司目录:结账瞬间被抢空本质是库存售罄,并非参数错误。
+			// 不计进 FailureCount,避免几次擦肩而过的秒空把设了 MaxRetries 的抢购任务判死。
+			return Outcome{
+				Attempted:        false,
+				WaitingForStock:  !retryPrepared,
+				RetryImmediately: retryPrepared,
+				Reason:           errMsg,
+			}
+		case catalog.DatacenterVerdictOutOfCatalog:
+			// 经短 TTL 刷新核实后机房确实不在本子公司该型号目录里:重试无益,直接终止。
+			if retryPrepared {
+				return Outcome{Attempted: false, RetryImmediately: true, Reason: errMsg}
+			}
+			return Outcome{Fatal: true, Attempted: true, Reason: errMsg}
+		}
 		// checkout 这一步最要紧:补货瞬间大家都在下单,429 是常态。
 		// 把它记成一次"真正的失败尝试"会让任务在唯一有货的那一分钟里自己判死。
 		outcome := attemptOutcome(err)
@@ -1011,4 +1040,25 @@ func BuildOrderSuccessMessage(item *types.QueueItem, orderID, managerURL string)
 	}
 	msg += "\n抢购任务ID: " + item.ID
 	return msg
+}
+
+// explainNotAvailableInDC 将 OVH "<fqn> is not available in <dc>" 按本子公司目录分类为:
+//   - DatacenterVerdictInCatalog: 机房明确在本子公司目录中,属阶段性库存售罄(被抢空)
+//   - DatacenterVerdictOutOfCatalog: 机房明确不在本子公司该型号目录中(真跨区/不支持该机房)
+//   - DatacenterVerdictUnknown: 目录暂不可用或未声明机房列表,保留客观中立说明
+func explainNotAvailableInDC(state *app.State, item *types.QueueItem, subsidiary, apiDC, stage string, err error) (string, catalog.DatacenterVerdict) {
+	verdict, catalogDCs := catalog.ClassifyDatacenterInSubsidiary(state, subsidiary, item.PlanCode, apiDC)
+	dcLabel := strings.ToUpper(strings.TrimSpace(apiDC))
+	subLabel := strings.ToUpper(strings.TrimSpace(subsidiary))
+	switch verdict {
+	case catalog.DatacenterVerdictInCatalog:
+		hint := fmt.Sprintf("%s该配置在机房 %s 已售罄，库存已被抢空（机房 %s 属于子公司 %s 的 %s 目录，任务将继续等待下一波放货）",
+			stage, dcLabel, dcLabel, subLabel, item.PlanCode)
+		return ovh.ExplainWithHint(err, hint), verdict
+	case catalog.DatacenterVerdictOutOfCatalog:
+		hint := catalog.FormatOutOfCatalogDatacenterMessage(subsidiary, item.PlanCode, apiDC, catalogDCs)
+		return ovh.ExplainWithHint(err, hint), verdict
+	default:
+		return ovh.Explain(err), verdict
+	}
 }

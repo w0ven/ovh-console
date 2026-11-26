@@ -217,3 +217,33 @@ func TestIsRenewPayloadRejectedRequiredProperty(t *testing.T) {
 		t.Error("403 不应触发降级")
 	}
 }
+
+// 回归:OVH 在 summary / checkout 返回 400 "<fqn> is not available in <dc>" 时,
+// 不能笼统归咎成"OVH 认为这次请求的参数不对",否则目录内合法机房瞬时售罄也会误导用户排查参数。
+func TestExplainNotAvailableInDatacenterAndCustomHint(t *testing.T) {
+	err := &ovhsdk.APIError{
+		Code:    400,
+		Class:   "Client::BadRequest",
+		Message: "27skle06-v1.ram-128g-ddr4-ecc-2400.hybridsoftraid-2x4000sa-2x500nvme is not available in fra",
+		QueryID: "EU.ext-2.6b087670.1614937.abc",
+	}
+	if !IsNotAvailableInDatacenter(err) {
+		t.Fatal("应当识别 400 is not available in")
+	}
+	if IsNotAvailableInDatacenter(&ovhsdk.APIError{Code: 500, Message: "backend is not available in cluster"}) {
+		t.Fatal("500 服务端错误不应误判为机房不可订购")
+	}
+
+	got := Explain(err)
+	if strings.Contains(got, "请求的参数不对") {
+		t.Fatalf("不应把 is not available in 说成请求参数不对: %s", got)
+	}
+	if !strings.Contains(got, "已售罄") || !strings.Contains(got, err.Message) || !strings.Contains(got, err.QueryID) {
+		t.Fatalf("缺少客观说明或丢失原文/查询号: %s", got)
+	}
+
+	withHint := ExplainWithHint(err, "结账瞬间该配置在机房 FRA 已售罄")
+	if !strings.HasPrefix(withHint, "结账瞬间该配置在机房 FRA 已售罄(OVH 400)。原文:") || !strings.Contains(withHint, err.QueryID) {
+		t.Fatalf("ExplainWithHint 格式不符合预期: %s", withHint)
+	}
+}

@@ -198,11 +198,10 @@ func GetInternal(state *app.State, accountID, planCode, datacenter string, optio
 			err = postBase()
 		}
 		if err != nil {
-			msg = ovh.Explain(err)
-			if strings.Contains(msg, "is not available in") {
-				state.Logger.Warn("配置在指定数据中心不可用: "+msg, "price")
-				return Result{Success: false, Error: "该配置在指定数据中心不可用"}
+			if ovh.IsNotAvailableInDatacenter(err) {
+				return explainPriceDatacenterUnavailable(state, accountID, subsidiary, planCode, apiDC, err)
 			}
+			msg = ovh.Explain(err)
 			// 跨区 planCode 的典型报错。实测在 EU 车上加购美区机型:
 			// POST /order/cart/{id}/eco → 400 {"message":"Plan code not found 24rise01-v1-us"}。
 			// OVH 三站目录独立(美区机型带 -us/-eu/-ca 后缀,欧区/加区不带),
@@ -371,6 +370,9 @@ func GetInternal(state *app.State, accountID, planCode, datacenter string, optio
 	// 之前 Go 静默忽略会导致瞬断时 success:true 但价格全 nil，前端误以为有效价格 0
 	var cartSummary map[string]interface{}
 	if err := client.Get("/order/cart/"+cartID+"/summary", &cartSummary); err != nil {
+		if ovh.IsNotAvailableInDatacenter(err) {
+			return explainPriceDatacenterUnavailable(state, accountID, subsidiary, planCode, apiDC, err)
+		}
 		return Result{Success: false, Error: ovh.Explain(err), Transient: transientErr(err)}
 	}
 
@@ -601,4 +603,22 @@ func splitRecurringAndSetup(info *PriceInfo, summary map[string]interface{}) {
 	info.Prices["recurringWithoutTax"] = round(recurringExcl)
 	info.Prices["setupWithTax"] = round(setupWith)
 	info.Prices["setupWithoutTax"] = round(setupExcl)
+}
+
+func explainPriceDatacenterUnavailable(state *app.State, accountID, subsidiary, planCode, apiDC string, err error) Result {
+	verdict, catalogDCs := catalog.ClassifyDatacenterInSubsidiary(state, subsidiary, planCode, apiDC)
+	dcLabel := strings.ToUpper(strings.TrimSpace(apiDC))
+	switch verdict {
+	case catalog.DatacenterVerdictInCatalog:
+		msg := fmt.Sprintf("该配置在机房 %s 当前已售罄/无库存", dcLabel)
+		state.Logger.Info(fmt.Sprintf("%s@%s 询价瞬间已售罄: %s", planCode, apiDC, ovh.ExplainWithHint(err, msg)), "price")
+		return Result{Success: false, Error: msg, Transient: false}
+	case catalog.DatacenterVerdictOutOfCatalog:
+		msg := catalog.FormatOutOfCatalogDatacenterMessage(subsidiary, planCode, apiDC, catalogDCs)
+		state.Logger.Warn(fmt.Sprintf("%s@%s 询价机房不在目录中: %s", planCode, apiDC, ovh.ExplainWithHint(err, msg)), "price")
+		return Result{Success: false, Error: msg, Transient: false}
+	default:
+		state.Logger.Warn("配置在指定数据中心不可用: "+ovh.Explain(err), "price")
+		return Result{Success: false, Error: "该配置在指定数据中心不可用", Transient: false}
+	}
 }

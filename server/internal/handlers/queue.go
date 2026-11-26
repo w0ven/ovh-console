@@ -100,6 +100,18 @@ func AddQueueItem(state *app.State) gin.HandlerFunc {
 				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": hint, "account_id": account})
 				return
 			}
+			if !body.Preorder {
+				acc, _ := state.FindAccount(account)
+				sub := catalog.SubsidiaryOfAccount(acc)
+				for _, dc := range body.Datacenters {
+					if dcVerdict, dcs := catalog.ClassifyDatacenter(state, account, body.PlanCode, dc); dcVerdict == catalog.DatacenterVerdictOutOfCatalog {
+						hint := catalog.FormatOutOfCatalogDatacenterMessage(sub, body.PlanCode, dc, dcs)
+						state.Logger.Warn(fmt.Sprintf("[queue] 拒绝任务(机房不在目录): %s", hint), "queue")
+						c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": hint, "account_id": account})
+						return
+					}
+				}
+			}
 		}
 		// 没给 / 给 0 = 用全局默认(设置页可改);超出区间夹回来
 		body.RetryInterval = types.ClampRetryInterval(body.RetryInterval, state.Config.RetryInterval())

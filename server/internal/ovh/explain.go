@@ -27,11 +27,20 @@ import (
 // 不是 OVH API 错误的(JSON 解析、数据库、上下文取消)原样返回 ——
 // 这个函数是可以无脑套在任何 error 上的。
 func Explain(err error) string {
+	return ExplainWithHint(err, "")
+}
+
+// ExplainWithHint 在已知业务上下文(如已通过目录区分出"机房售罄"与"跨区机房")时,
+// 用精确的中文提示替换默认通用猜测,同时保留 OVH 状态码、原始报错与 QueryID。
+func ExplainWithHint(err error, customHint string) string {
 	if err == nil {
 		return ""
 	}
 	var apiErr *ovhsdk.APIError
 	if !errors.As(err, &apiErr) {
+		if strings.TrimSpace(customHint) != "" {
+			return fmt.Sprintf("%s。原文:%s", customHint, err.Error())
+		}
 		// 网络层单独认一下:这是"你的机器连不上 OVH",和"OVH 拒绝了你"
 		// 完全是两件事,给的下一步也不一样。
 		var netErr net.Error
@@ -45,7 +54,10 @@ func Explain(err error) string {
 		return err.Error()
 	}
 
-	hint := hintFor(apiErr)
+	hint := strings.TrimSpace(customHint)
+	if hint == "" {
+		hint = hintFor(apiErr)
+	}
 	msg := strings.TrimSpace(apiErr.Message)
 	if msg == "" {
 		msg = fmt.Sprintf("HTTP %d", apiErr.Code)
@@ -93,6 +105,11 @@ func hintFor(e *ovhsdk.APIError) string {
 			"(最省事的是 GET/POST/PUT/DELETE 各给一条 /*),改完要重新授权"
 	case strings.Contains(lower, "expired"):
 		return "凭据或令牌已过期,需要重新生成"
+	case strings.Contains(lower, "is not available in"):
+		// OVH 在 summary / checkout 阶段对"目录内机房已售罄"和"机房不在当前子公司目录"
+		// 返回完全相同的 "<fqn> is not available in <dc>" (400)。通用层没有目录上下文,
+		// 不能武断归咎为"请求参数不对",给出客观的双向说明。
+		return "该配置在所选机房当前不可订购(常见于结账或询价瞬间库存已售罄,或该机房不在当前账户子公司的销售目录里)"
 	}
 
 	switch e.Code {
@@ -219,4 +236,21 @@ func IsTaskConflict(err error) bool {
 		}
 	}
 	return false
+}
+
+// IsNotAvailableInDatacenter 认出 OVH 购物车/结账阶段的 "<fqn/plan> is not available in <dc>" 拒绝。
+// OVH 对"目录内合法机房但结账瞬间已售罄"与"机房不在当前子公司目录"返回完全相同的 400/409 文案,
+// 有账户与目录上下文的调用方应结合 catalog.ClassifyDatacenter 进一步区分两者。
+func IsNotAvailableInDatacenter(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *ovhsdk.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Code != 0 && apiErr.Code != http.StatusBadRequest && apiErr.Code != http.StatusConflict {
+			return false
+		}
+		return strings.Contains(strings.ToLower(apiErr.Message), "is not available in")
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "is not available in")
 }

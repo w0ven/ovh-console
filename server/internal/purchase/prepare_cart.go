@@ -222,6 +222,9 @@ func prepareCart(ctx context.Context, state *app.State, item *types.QueueItem, a
 					retainEmpty()
 					return nil, Outcome{WaitingForCatalog: true, Reason: ovh.Explain(err)}
 				}
+				if out, ok := cartStepNotAvailableOutcome(state, item, subsidiary, apiDC, "加购瞬间", err, fail); ok {
+					return nil, out
+				}
 				state.Logger.Error(fmt.Sprintf("购买 %s 时发生 OVH API 错误: %s", item.PlanCode, err.Error()), "purchase")
 				state.Logger.Error(fmt.Sprintf("错误发生时的购物车ID: %s", cartID), "purchase")
 				fail(ovh.Explain(err))
@@ -322,6 +325,9 @@ func prepareCart(ctx context.Context, state *app.State, item *types.QueueItem, a
 				}
 				if item.Preorder && listingNotReady(err) {
 					return nil, Outcome{WaitingForCatalog: true, Reason: ovh.Explain(err)}
+				}
+				if out, ok := cartStepNotAvailableOutcome(state, item, subsidiary, apiDC, "配置购物车瞬间", err, fail); ok {
+					return nil, out
 				}
 				errMsg := err.Error()
 				state.Logger.Error(fmt.Sprintf("购买 %s 时发生 OVH API 错误(%s): %s", item.PlanCode, cfg.label, errMsg), "purchase")
@@ -460,13 +466,19 @@ func prepareCart(ctx context.Context, state *app.State, item *types.QueueItem, a
 						retainPartial()
 						return nil, Outcome{WaitingForCatalog: true, Reason: ovh.Explain(err)}
 					}
+					var apiErr *ovhsdk.APIError
+					retryCachedOpts := cachedOptions && errors.As(err, &apiErr) && (apiErr.Code == 400 || apiErr.Code == 404)
+					if !retryCachedOpts {
+						if out, ok := cartStepNotAvailableOutcome(state, item, subsidiary, apiDC, "加购硬件选项瞬间", err, fail); ok {
+							return nil, out
+						}
+					}
 					state.Logger.Error(fmt.Sprintf("添加 Eco 选项 %s 失败: %s", t.planCode, err.Error()), "purchase")
 					// 关键选项添加失败 → 整单失败。不能静默继续 checkout,否则会下到错误配置。
 					errMsg := fmt.Sprintf("添加 Eco 选项 %s 失败: %s（已取消下单避免下到错误配置）", t.planCode, ovh.Explain(err))
 					fail(errMsg)
 					out := attemptOutcome(err)
-					var apiErr *ovhsdk.APIError
-					out.RetryImmediately = cachedOptions && errors.As(err, &apiErr) && (apiErr.Code == 400 || apiErr.Code == 404)
+					out.RetryImmediately = retryCachedOpts
 					if out.RetryImmediately {
 						out.Attempted = false
 					}
@@ -541,5 +553,24 @@ func listingNotReady(err error) bool {
 func checkoutPayload(autoPay bool) map[string]interface{} {
 	return map[string]interface{}{
 		"autoPayWithPreferredPaymentMethod": autoPay,
+	}
+}
+
+func cartStepNotAvailableOutcome(state *app.State, item *types.QueueItem, subsidiary, apiDC, stage string, err error, fail func(string)) (Outcome, bool) {
+	if item.Preorder || !ovh.IsNotAvailableInDatacenter(err) {
+		return Outcome{}, false
+	}
+	msg, verdict := explainNotAvailableInDC(state, item, subsidiary, apiDC, stage, err)
+	switch verdict {
+	case catalog.DatacenterVerdictInCatalog:
+		state.Logger.Warn(msg, "purchase")
+		fail(msg)
+		return Outcome{WaitingForStock: true, Attempted: false, Reason: msg}, true
+	case catalog.DatacenterVerdictOutOfCatalog:
+		state.Logger.Error(msg, "purchase")
+		fail(msg)
+		return Outcome{Fatal: true, Attempted: true, Reason: msg}, true
+	default:
+		return Outcome{}, false
 	}
 }
