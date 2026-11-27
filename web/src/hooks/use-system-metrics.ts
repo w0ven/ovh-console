@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import i18n from "@/i18n";
 import { apiMessage } from "@/lib/api-error";
@@ -24,6 +24,10 @@ export interface UpdateCheck {
   tag: string;
   name: string;
   hasUpdate: boolean;
+  /** 该新版本是否已被用户在 Web 或 Telegram 标记为忽略提醒 */
+  ignored?: boolean;
+  /** 当前后端记录的已忽略版本号（不含 v） */
+  ignoredVersion?: string;
   url: string;
   publishedAt: string;
   body: string;
@@ -69,6 +73,27 @@ export function useSelfUpdate() {
   return useMutation({
     mutationFn: async () =>
       (await api.post<{ success: boolean; message?: string; error?: string; latest?: string }>("/version/update")).data,
+  });
+}
+
+/** 忽略或恢复（传空串）指定新版本的更新提醒，后端持久化在 SQLite kv 中并与 Telegram 同步。 */
+export function useIgnoreUpdateVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (version: string) =>
+      (await api.post<{ status: string; ignoredVersion: string }>("/version/ignore", { version })).data,
+    onSuccess: (res) => {
+      qc.setQueryData<UpdateCheck | undefined>(["app", "update-check"], (prev) => {
+        if (!prev) return prev;
+        const ignoredVer = res?.ignoredVersion || "";
+        return {
+          ...prev,
+          ignoredVersion: ignoredVer,
+          ignored: Boolean(prev.hasUpdate && ignoredVer && ignoredVer === prev.latest),
+        };
+      });
+      void qc.invalidateQueries({ queryKey: ["app", "update-check"] });
+    },
   });
 }
 

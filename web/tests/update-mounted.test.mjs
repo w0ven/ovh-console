@@ -168,7 +168,9 @@ test("mounted UpdateButton and VersionUpdateTrigger auto-poll after first-fetch 
         createElement(QueryClientProvider, { client: sharedQC }, createElement(UpdateButton, { check, progressPollMs: 30 })),
       );
     });
-    const startBtn = container1.querySelector("button");
+    const startBtn = [...container1.querySelectorAll("button")].find((b) =>
+      (b.textContent || "").includes("立即更新"),
+    );
     assert.ok(startBtn, "UpdateButton should render update button");
     await act(async () => {
       startBtn.click();
@@ -328,8 +330,12 @@ test("mounted UpdateButton and VersionUpdateTrigger auto-poll after first-fetch 
         createElement(QueryClientProvider, { client: sharedQC }, createElement(UpdateButton, { check, progressPollMs: 30 })),
       );
     });
+    const startBtn3 = [...container3.querySelectorAll("button")].find((b) =>
+      (b.textContent || "").includes("立即更新"),
+    );
+    assert.ok(startBtn3, "expected UpdateButton immediate-update button in phase 3");
     await act(async () => {
-      container3.querySelector("button").click();
+      startBtn3.click();
       await sleep(20);
     });
 
@@ -436,7 +442,9 @@ test("mounted UpdateButton and VersionUpdateTrigger auto-poll after first-fetch 
         ),
       );
     });
-    const btn4 = container4.querySelector("button");
+    const btn4 = [...container4.querySelectorAll("button")].find((b) =>
+      (b.textContent || "").includes("立即更新"),
+    );
     assert.ok(btn4, "expected UpdateButton button in phase 4");
     await act(async () => {
       btn4.click();

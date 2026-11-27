@@ -9,7 +9,7 @@ import { NAV_GROUPS } from "@/components/layout/nav";
 import { AccountSwitcher } from "@/components/layout/AccountSwitcher";
 import { ThemeToggle } from "@/components/layout/ThemeToggle";
 import { LanguageToggle } from "@/components/layout/LanguageToggle";
-import { VersionUpdateTrigger } from "@/components/common/VersionUpdateTrigger";
+import { openVersionUpdateDialog, VersionUpdateTrigger } from "@/components/common/VersionUpdateTrigger";
 import { useAppVersion, useUpdateCheck } from "@/hooks/use-system-metrics";
 
 /**
@@ -180,28 +180,36 @@ export function AppShell() {
               )}
               <span className="nav-label">{collapsed && !mobile ? "" : t("shell.collapseRail")}</span>
             </button>
-            {/* GitHub 仓库入口。收起态 GitHub 图标仍在,title 提示仓库地址 */}
-            <a
-              href="https://github.com/w0ven/ovh-console"
-              target="_blank"
-              rel="noreferrer"
-              className="nav-item"
-              title="github.com/w0ven/ovh-console"
-            >
-              <Github className="nav-ico" size={16} strokeWidth={1.9} />
-              <span className="nav-label">{t("shell.repo")}</span>
+            {/* GitHub 仓库入口与版本号分离：点 GitHub 看仓库，点版本号直接打开更新说明与忽略设置弹窗 */}
+            <div className="flex items-center">
+              <a
+                href="https://github.com/w0ven/ovh-console"
+                target="_blank"
+                rel="noreferrer"
+                className="nav-item flex-1 min-w-0"
+                title="github.com/w0ven/ovh-console"
+              >
+                <Github className="nav-ico" size={16} strokeWidth={1.9} />
+                <span className="nav-label">{t("shell.repo")}</span>
+              </a>
               {!collapsed && version && (
-                <span
-                  className="tnum inline-flex items-center gap-1"
+                <button
+                  type="button"
+                  onClick={openVersionUpdateDialog}
+                  title={
+                    updateCheck?.hasUpdate && !updateCheck?.ignored
+                      ? t("commons.update.pillTitleUpdate", { version: updateCheck.latest })
+                      : t("commons.update.pillTitleCurrent")
+                  }
+                  className="tnum inline-flex items-center gap-1 px-2 py-1 rounded-md hover:bg-muted/70 transition-colors cursor-pointer shrink-0"
                   style={{
-                    marginLeft: "auto",
                     fontSize: 11,
-                    color: updateCheck?.hasUpdate ? "#d97706" : "var(--ink-faint)",
-                    fontWeight: updateCheck?.hasUpdate ? 600 : 500,
+                    color: updateCheck?.hasUpdate && !updateCheck?.ignored ? "#d97706" : "var(--ink-faint)",
+                    fontWeight: updateCheck?.hasUpdate && !updateCheck?.ignored ? 600 : 500,
                   }}
                 >
                   v{version}
-                  {updateCheck?.hasUpdate && (
+                  {updateCheck?.hasUpdate && !updateCheck?.ignored && (
                     <span
                       style={{
                         width: 6,
@@ -213,16 +221,25 @@ export function AppShell() {
                       aria-hidden="true"
                     />
                   )}
-                </span>
+                </button>
               )}
-            </a>
+            </div>
             {collapsed && !mobile && version && (
-              <div
-                className="tnum"
-                style={{ textAlign: "center", fontSize: 10.5, color: "var(--ink-faint)", padding: "2px 0 4px" }}
+              <button
+                type="button"
+                onClick={openVersionUpdateDialog}
+                title={t("commons.update.pillTitleCurrent")}
+                className="tnum w-full hover:opacity-80 cursor-pointer"
+                style={{
+                  textAlign: "center",
+                  fontSize: 10.5,
+                  color: updateCheck?.hasUpdate && !updateCheck?.ignored ? "#d97706" : "var(--ink-faint)",
+                  fontWeight: updateCheck?.hasUpdate && !updateCheck?.ignored ? 600 : 400,
+                  padding: "2px 0 4px",
+                }}
               >
                 v{version}
-              </div>
+              </button>
             )}
           </div>
         </aside>

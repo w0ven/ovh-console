@@ -89,6 +89,7 @@ const pack: WatchPagesPack = {
       empty: "No history yet",
       available: "In stock",
       unavailable: "Out of stock",
+      priceCheckFailed: "Price check failed",
     },
     dialog: {
       editTitle: "Edit subscription",
@@ -217,6 +218,7 @@ const pack: WatchPagesPack = {
       empty: "No history yet",
       available: "In stock",
       unavailable: "Out of stock",
+      priceCheckFailed: "Price check failed",
     },
     dialog: {
       editTitle: "Edit VPS subscription",

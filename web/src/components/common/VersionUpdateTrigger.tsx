@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
+  Bell,
+  BellOff,
   Check,
   Copy,
   Download,
@@ -21,10 +23,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
+import { apiMessage } from "@/lib/api-error";
 import { cn } from "@/lib/utils";
 import {
   allocateUpdateProgressRunId,
   useAppVersion,
+  useIgnoreUpdateVersion,
   useSelfUpdate,
   useUpdateCheck,
   useUpdateProgress,
@@ -35,7 +39,23 @@ import { useQueueList } from "@/hooks/use-queue";
 
 const CONTAINER_LATEST_CMD = "docker compose pull && docker compose up -d";
 
-export type UpdateCheckViewState = "loading" | "error" | "staleError" | "available" | "upToDate" | "unknown";
+/** 全局自定义事件名：侧栏底部或仪表盘点击高亮版本号时统一打开本弹窗 */
+export const OPEN_VERSION_DIALOG_EVENT = "ovh-open-version-dialog";
+
+export function openVersionUpdateDialog(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(OPEN_VERSION_DIALOG_EVENT));
+  }
+}
+
+export type UpdateCheckViewState =
+  | "loading"
+  | "error"
+  | "staleError"
+  | "available"
+  | "ignored"
+  | "upToDate"
+  | "unknown";
 
 export function deriveUpdateViewState(params: {
   isPending: boolean;
@@ -50,7 +70,66 @@ export function deriveUpdateViewState(params: {
     return "error";
   }
   if (!params.check || !params.check.latest) return "unknown";
-  return params.check.hasUpdate ? "available" : "upToDate";
+  if (params.check.hasUpdate) {
+    return params.check.ignored ? "ignored" : "available";
+  }
+  return "upToDate";
+}
+
+export interface ParsedReleaseNotes {
+  sections: { heading?: string; items: string[]; paragraphs: string[] }[];
+  compareUrl?: string;
+}
+
+const COMPARE_LINE_RE = /^\s*\*?\*?full\s+changelog\*?\*?\s*:\s*(https?:\/\/\S+)\s*$/i;
+
+/**
+ * 解析 GitHub Release Markdown 正文为结构化可读区块：
+ * - 自动提取 `**Full Changelog**: https://...` 链接；若正文只有这一行则 sections 为空，前端给出明确提示与对比按钮，不再原样吐一行裸 Markdown
+ * - 支持 `## / ###` 分组标题与 `- / *` 列表项，去除列表项里的冗余 `**bold**` 星号标记
+ */
+export function parseReleaseNotes(raw?: string): ParsedReleaseNotes {
+  if (!raw || !raw.trim()) return { sections: [] };
+  let compareUrl: string | undefined;
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  const sections: { heading?: string; items: string[]; paragraphs: string[] }[] = [];
+  let current: { heading?: string; items: string[]; paragraphs: string[] } = { items: [], paragraphs: [] };
+
+  const stripInlineMd = (s: string) =>
+    s
+      .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+      .replace(/`([^`\n]+)`/g, "$1")
+      .trim();
+
+  const flushCurrent = () => {
+    if (current.heading || current.items.length > 0 || current.paragraphs.length > 0) {
+      sections.push(current);
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const compareMatch = line.match(COMPARE_LINE_RE);
+    if (compareMatch) {
+      compareUrl = compareMatch[1];
+      continue;
+    }
+    const headingMatch = line.match(/^#{1,4}\s+(.+)$/);
+    if (headingMatch) {
+      flushCurrent();
+      current = { heading: stripInlineMd(headingMatch[1]), items: [], paragraphs: [] };
+      continue;
+    }
+    const bulletMatch = line.match(/^[-*•]\s+(.+)$/);
+    if (bulletMatch) {
+      current.items.push(stripInlineMd(bulletMatch[1]));
+      continue;
+    }
+    current.paragraphs.push(stripInlineMd(line));
+  }
+  flushCurrent();
+  return { sections, compareUrl };
 }
 
 export interface RestartPollState {
@@ -276,11 +355,9 @@ function formatPublishedAt(iso?: string): string {
 
 /**
  * 全局版本徽章 + 「版本与更新」弹窗（参考 OpenBear 更新策略）：
- * - 常驻顶栏，全站任意页面均可第一时间看到新版本高亮胶囊与琥珀圆点
- * - 精确区分 检查中 / 失败 / 未知 / 已是最新 / 有可用更新 五种状态，不会把失败误显示成“已是最新”
- * - 复用已鉴权队列状态（useQueue）统计运行中任务数，公共版本接口零敏感信息暴露
- * - 容器部署清晰区分浮动 tag 与固定版本/digest 两种更新步骤，并提供一键复制命令
- * - 裸机单二进制部署支持弹窗内二次确认触发自更新、进度条与串行重启探测刷新
+ * - 常驻顶栏，侧栏底部与仪表盘版本号点击也统一唤起本弹窗（不再直接外跳 GitHub 链接）
+ * - 支持在弹窗内结构化查看更新内容，并可一键「忽略此版本 / 恢复提醒」（服务端 SQLite 持久化，与 Telegram 同步）
+ * - 精确区分 检查中 / 失败 / 未知 / 已是最新 / 已忽略 / 有可用更新 六种状态
  */
 export function VersionUpdateTrigger({
   initialOpen = false,
@@ -298,6 +375,7 @@ export function VersionUpdateTrigger({
   const update = useUpdateCheck();
   const queue = useQueueList();
   const mut = useSelfUpdate();
+  const ignoreMut = useIgnoreUpdateVersion();
 
   const [open, setOpen] = useState(initialOpen);
   const [confirming, setConfirming] = useState(false);
@@ -320,11 +398,24 @@ export function VersionUpdateTrigger({
   const currentVersion = check?.current || appVersion || "";
   const latestVersion = check?.latest || "";
   const hasUpdate = Boolean(check?.hasUpdate);
+  const isIgnored = Boolean(hasUpdate && check?.ignored);
+  const showHighlight = hasUpdate && !isIgnored;
   const refreshFailed = update.isError || Boolean(check?.lastError);
   const activeTasks = (queue.data ?? []).filter((it) => it.status === "running").length;
+  const parsedNotes = parseReleaseNotes(check?.body);
   const pinnedUpdateCmd = latestVersion
     ? `# 1) 从 Docker Actions 构建摘要获取多架构 digest，或执行下方命令查询：\ndocker buildx imagetools inspect ghcr.io/w0ven/ovh-console:${latestVersion} | grep Digest\n# 2) 在 docker-compose.yml 中固定镜像 digest（示例）：\n#    image: ghcr.io/w0ven/ovh-console@sha256:<digest>\n# 3) 拉取并重建容器：\ndocker compose pull && docker compose up -d`
     : CONTAINER_LATEST_CMD;
+
+  useEffect(() => {
+    const onOpen = () => {
+      setConfirming(false);
+      setOpen(true);
+      void update.refetch();
+    };
+    window.addEventListener(OPEN_VERSION_DIALOG_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_VERSION_DIALOG_EVENT, onOpen);
+  }, [update]);
 
   const progress = useUpdateProgress(started && !waitingRestart, updateRunId, progressPollMs);
   // 只有本轮成功收到一次真实服务端响应后，才采信并渲染 progress.data；首轮尚未成功或失败期间绝不渲染残留缓存
@@ -439,6 +530,21 @@ export function VersionUpdateTrigger({
     }
   };
 
+  const handleToggleIgnore = async () => {
+    if (!latestVersion) return;
+    try {
+      if (isIgnored) {
+        await ignoreMut.mutateAsync("");
+        toast.success(t("commons.update.unignoredToast"));
+      } else {
+        await ignoreMut.mutateAsync(latestVersion);
+        toast.success(t("commons.update.ignoredToast", { version: latestVersion }));
+      }
+    } catch (e: any) {
+      toast.error(apiMessage(e) || t("commons.update.ignoreFailed"));
+    }
+  };
+
   const handleStartUpdate = async () => {
     setFailed(null);
     setConfirming(false);
@@ -462,20 +568,24 @@ export function VersionUpdateTrigger({
     }
   };
 
-  const pillTitle = hasUpdate
+  const pillTitle = showHighlight
     ? t("commons.update.pillTitleUpdate", { version: latestVersion })
-    : t("commons.update.pillTitleCurrent");
+    : isIgnored
+      ? t("commons.update.pillTitleIgnored", { version: latestVersion })
+      : t("commons.update.pillTitleCurrent");
 
   const statusChipText =
     viewState === "available"
       ? t("commons.update.availableChip")
-      : viewState === "upToDate"
-        ? t("commons.update.latestChip")
-        : viewState === "loading"
-          ? t("commons.update.checking")
-          : viewState === "error" || viewState === "staleError"
-            ? t("commons.update.checkErrorChip")
-            : t("commons.update.unknownChip");
+      : viewState === "ignored"
+        ? t("commons.update.ignoredChip")
+        : viewState === "upToDate"
+          ? t("commons.update.latestChip")
+          : viewState === "loading"
+            ? t("commons.update.checking")
+            : viewState === "error" || viewState === "staleError"
+              ? t("commons.update.checkErrorChip")
+              : t("commons.update.unknownChip");
 
   return (
     <>
@@ -486,18 +596,18 @@ export function VersionUpdateTrigger({
         aria-label={pillTitle}
         className={cn(
           "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium leading-none transition-colors cursor-pointer shrink-0",
-          hasUpdate
+          showHighlight
             ? "border-amber-400/70 bg-amber-500/12 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
             : "border-border/80 bg-background/70 text-muted-foreground hover:bg-muted/80 hover:text-foreground",
         )}
       >
         {waitingRestart || started ? (
           <Loader2 className="w-3 h-3 animate-spin" />
-        ) : hasUpdate ? (
+        ) : showHighlight ? (
           <Sparkles className="w-3 h-3" />
         ) : null}
         <span className="font-mono tnum">v{currentVersion || "…"}</span>
-        {hasUpdate && (
+        {showHighlight && (
           <span
             className="w-1.5 h-1.5 rounded-full bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.22)]"
             aria-hidden="true"
@@ -540,7 +650,7 @@ export function VersionUpdateTrigger({
               <ArrowRight className="w-4 h-4 text-muted-foreground shrink-0" aria-hidden="true" />
               <div className="min-w-0">
                 <div className="text-[11px] text-muted-foreground">
-                  {viewState === "available"
+                  {hasUpdate
                     ? t("commons.update.latestLabel")
                     : viewState === "upToDate"
                       ? t("commons.update.installedLabel")
@@ -549,7 +659,8 @@ export function VersionUpdateTrigger({
                 <div
                   className={cn(
                     "mt-0.5 font-mono text-base font-semibold tnum",
-                    hasUpdate && "text-amber-700 dark:text-amber-300",
+                    showHighlight && "text-amber-700 dark:text-amber-300",
+                    isIgnored && "text-muted-foreground",
                   )}
                 >
                   {latestVersion ? `v${latestVersion}` : "—"}
@@ -595,6 +706,65 @@ export function VersionUpdateTrigger({
                 </span>
               </div>
             )}
+
+            {/* 更新说明（放在显眼位置，点开即可直接阅读，且格式化 Markdown 列表与标题） */}
+            <section className="rounded-xl border border-border overflow-hidden">
+              <div className="px-3.5 py-2 border-b border-border bg-muted/30 flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-muted-foreground">
+                  {t("commons.update.notesHeading")}
+                  {latestVersion ? ` · v${latestVersion}` : ""}
+                </span>
+                {parsedNotes.compareUrl && (
+                  <a
+                    href={parsedNotes.compareUrl}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline"
+                  >
+                    {t("commons.update.openCompareLink")}
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+              </div>
+              <div className="px-3.5 py-3 max-h-64 overflow-y-auto text-xs leading-relaxed space-y-2.5">
+                {parsedNotes.sections.length > 0 ? (
+                  parsedNotes.sections.map((sec, idx) => (
+                    <div key={idx} className="space-y-1.5">
+                      {sec.heading && (
+                        <div className="font-semibold text-foreground">{sec.heading}</div>
+                      )}
+                      {sec.items.length > 0 && (
+                        <ul className="list-disc pl-4 space-y-1 text-foreground/90">
+                          {sec.items.map((item, i) => (
+                            <li key={i} className="break-words">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                      {sec.paragraphs.map((p, i) => (
+                        <p key={i} className="text-foreground/90 break-words whitespace-pre-wrap">{p}</p>
+                      ))}
+                    </div>
+                  ))
+                ) : parsedNotes.compareUrl ? (
+                  <div className="space-y-2 text-muted-foreground">
+                    <p>{t("commons.update.notesCompareOnly")}</p>
+                    <a
+                      href={parsedNotes.compareUrl}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
+                    >
+                      {t("commons.update.openCompareLink")}
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground">
+                    {latestVersion ? t("commons.update.notesEmpty") : t("commons.update.noReleaseYet")}
+                  </p>
+                )}
+              </div>
+            </section>
 
             {/* 运行中抢购任务提示（来自已鉴权的 useQueue） */}
             {hasUpdate && activeTasks > 0 && (
@@ -668,24 +838,6 @@ export function VersionUpdateTrigger({
               </div>
             )}
 
-            {/* 更新说明（GitHub Release body） */}
-            <section className="rounded-xl border border-border overflow-hidden">
-              <div className="px-3.5 py-2 border-b border-border bg-muted/30 text-xs font-medium text-muted-foreground">
-                {t("commons.update.notesHeading")}
-              </div>
-              <div className="px-3.5 py-3 max-h-60 overflow-y-auto text-xs leading-relaxed">
-                {check?.body?.trim() ? (
-                  <pre className="whitespace-pre-wrap break-words font-sans text-foreground/90">
-                    {check.body.trim()}
-                  </pre>
-                ) : (
-                  <p className="text-muted-foreground">
-                    {latestVersion ? t("commons.update.notesEmpty") : t("commons.update.noReleaseYet")}
-                  </p>
-                )}
-              </div>
-            </section>
-
             {/* 裸机二次确认条（参考 OpenBear 更新确认） */}
             {confirming && hasUpdate && !check?.inContainer && (
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-400/50 bg-amber-500/10 px-3.5 py-2.5 text-xs">
@@ -711,24 +863,50 @@ export function VersionUpdateTrigger({
             )}
           </div>
 
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-              {t("common.close")}
-            </Button>
-            {hasUpdate && !check?.inContainer && !confirming && (
-              <Button
-                type="button"
-                disabled={mut.isPending || started || waitingRestart}
-                onClick={() => setConfirming(true)}
-              >
-                {mut.isPending || started || waitingRestart ? (
-                  <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                ) : (
-                  <Download className="w-3.5 h-3.5 mr-1.5" />
-                )}
-                {t("commons.update.updateTo", { version: latestVersion })}
+          <DialogFooter className="flex flex-wrap items-center justify-between gap-2 sm:justify-between">
+            <div>
+              {hasUpdate && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  disabled={ignoreMut.isPending || started || waitingRestart}
+                  onClick={() => void handleToggleIgnore()}
+                >
+                  {isIgnored ? (
+                    <>
+                      <Bell className="w-3.5 h-3.5 mr-1.5" />
+                      {t("commons.update.unignoreVersion")}
+                    </>
+                  ) : (
+                    <>
+                      <BellOff className="w-3.5 h-3.5 mr-1.5" />
+                      {t("commons.update.ignoreVersion")}
+                    </>
+                  )}
+                </Button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                {t("common.close")}
               </Button>
-            )}
+              {hasUpdate && !check?.inContainer && !confirming && (
+                <Button
+                  type="button"
+                  disabled={mut.isPending || started || waitingRestart}
+                  onClick={() => setConfirming(true)}
+                >
+                  {mut.isPending || started || waitingRestart ? (
+                    <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5 mr-1.5" />
+                  )}
+                  {t("commons.update.updateTo", { version: latestVersion })}
+                </Button>
+              )}
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

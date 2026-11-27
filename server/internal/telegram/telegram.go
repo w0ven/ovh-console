@@ -483,6 +483,7 @@ var BotCommands = []map[string]string{
 	{"command": "speed", "description": "抢购速度：发现库存到发出结账"},
 	{"command": "monitor", "description": "启动 / 停止监控（/monitor on|off）"},
 	{"command": "pauseall", "description": "暂停全部运行中的任务"},
+	{"command": "version", "description": "查看当前版本、更新说明与忽略提醒"},
 }
 
 // RegisterCommands 把命令菜单推给 Telegram。

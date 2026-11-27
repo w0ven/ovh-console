@@ -15,14 +15,16 @@ import (
 	"time"
 
 	"github.com/ovh-buy/server/internal/app"
+	"github.com/ovh-buy/server/internal/catalog"
 	"github.com/ovh-buy/server/internal/types"
 )
 
 // 独立 worker 应同时派发整批,第一个慢任务不能挡住第 11 个及之后的任务。
+// 各任务机房不同(不同配置),每个各自成组;同配置合并见 group_worker_test.go。
 func TestQueueDoesNotWaitForBatchBarrier(t *testing.T) {
 	state := queueCompletionState(t)
 	for i := 0; i < 16; i++ {
-		state.Queue = append(state.Queue, types.QueueItem{ID: fmt.Sprint(i), PlanCode: "plan", Datacenter: "gra", Status: "running", RetryInterval: 60})
+		state.Queue = append(state.Queue, types.QueueItem{ID: fmt.Sprint(i), PlanCode: "plan", Datacenter: fmt.Sprint("dc", i), Status: "running", RetryInterval: 60})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -91,6 +93,8 @@ func TestPausedWorkerRejectsLateStockSignal(t *testing.T) {
 // hotFixture 所有 OVH 写入都到本机假 API;公开目录也被离线 transport 截获。
 func hotFixture(t *testing.T) (*app.State, *atomic.Int32, *atomic.Int32, *atomic.Bool) {
 	t.Helper()
+	catalog.ResetCachesForTesting()
+	t.Cleanup(catalog.ResetCachesForTesting)
 	state := queueCompletionState(t)
 	var carts, checkouts atomic.Int32
 	var stock atomic.Bool
@@ -417,4 +421,32 @@ func TestQueueSignalDispatchesPrebuiltCheckoutImmediately(t *testing.T) {
 		t.Fatal(carts.Load(), checkouts.Load(), timing)
 	}
 	t.Logf("channel + worker + prepared checkout + local TCP write: %dus reused=%t", timing.Dispatch.DetectionToWriteUS, timing.Dispatch.ConnectionReused)
+}
+
+// N1 竞态保护回归:整单修改刚刚更新了数据库里的 max_orders,worker 拿着旧快照(GroupLimit=3 != DB 2)走到 ClaimQueueOrder 时,
+// 必须返回 RetryImmediately=true(PauseTask=false),绝不误判为 checkoutUncertain 暂停。
+func TestClaimGroupLimitChangedRetriesInsteadOfUncertainPause(t *testing.T) {
+	state, _, checkouts, stock := hotFixture(t)
+	stock.Store(true)
+	// 先模拟同组另一条任务以旧上限 3 登记过一次,再由整单编辑把数据库里的 max_orders 改成 2
+	seedClaim := types.QueueItem{ID: "peer", OrderGroup: "grp-race", GroupLimit: 3}
+	if ok, err := state.DB.ClaimQueueOrder(seedClaim); err != nil || !ok {
+		t.Fatalf("seed claim failed: ok=%v err=%v", ok, err)
+	}
+	if err := state.DB.MarkQueueOrder(seedClaim, "ordered"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := state.DB.SetOrderGroupLimit("grp-race", 2); err != nil || !ok {
+		t.Fatalf("SetOrderGroupLimit failed: ok=%v err=%v", ok, err)
+	}
+	staleSnapshot := types.QueueItem{
+		ID: "stale-worker", AccountID: "hot-eu", PlanCode: "plan", Datacenter: "gra",
+		Options: []string{"ram-32g"}, Status: "running", RetryInterval: 60,
+		OrderGroup: "grp-race", GroupLimit: 3, // 旧快照仍是 3,而数据库已改成 2
+	}
+	state.Queue = []types.QueueItem{staleSnapshot}
+	out := PurchaseServer(context.Background(), state, &staleSnapshot)
+	if out.PauseTask || !out.RetryImmediately || checkouts.Load() != 0 {
+		t.Fatalf("stale GroupLimit snapshot must retry immediately without checkout or uncertain pause: out=%+v checkouts=%d", out, checkouts.Load())
+	}
 }

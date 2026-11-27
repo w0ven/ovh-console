@@ -76,7 +76,7 @@ func noSleep(time.Duration) {}
 
 // 恰好一笔型号/机房/周期吻合的订单:任务标为已下单,历史记下订单号;另一型号的订单不被误认。
 func TestResolverConfirmsSingleMatchingOrder(t *testing.T) {
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target := resolveFixture(t, "ovh-eu", map[int64][3]string{
 		555: {"24ska01", "gra", "P1M"},
 		556: {"24rise01", "gra", "P1M"},
@@ -95,7 +95,7 @@ func TestResolverConfirmsSingleMatchingOrder(t *testing.T) {
 
 // 两笔都吻合:无法判断是哪一笔,任务保持暂停。
 func TestResolverLeavesAmbiguousOrdersToUser(t *testing.T) {
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target := resolveFixture(t, "ovh-eu", map[int64][3]string{
 		555: {"24ska01", "gra", "P1M"},
 		556: {"24ska01", "gra", "P1M"},
@@ -108,7 +108,7 @@ func TestResolverLeavesAmbiguousOrdersToUser(t *testing.T) {
 
 // 用户已确认没有订单并恢复任务(结账登记被清除):核对结果作废,不把任务改成已下单。
 func TestResolverStopsWhenUserResumed(t *testing.T) {
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target := resolveFixture(t, "ovh-eu", map[int64][3]string{555: {"24ska01", "gra", "P1M"}})
 	if err := state.ResumeQueueItem("task-1", "running"); err != nil {
 		t.Fatal(err)
@@ -121,7 +121,7 @@ func TestResolverStopsWhenUserResumed(t *testing.T) {
 
 // 订单号已记在别的任务名下:不能再记一次;美国站只提示不确认。
 func TestResolverSkipsClaimedOrdersAndUSAccounts(t *testing.T) {
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target := resolveFixture(t, "ovh-eu", map[int64][3]string{555: {"24ska01", "gra", "P1M"}})
 	state.HistoryMu.Lock()
 	state.History = append(state.History, types.PurchaseHistoryEntry{ID: "h", TaskID: "other", AccountID: "acc", OrderID: "555", Status: "success"})
@@ -131,7 +131,7 @@ func TestResolverSkipsClaimedOrdersAndUSAccounts(t *testing.T) {
 		t.Fatalf("order credited to another task was reused: %q", got)
 	}
 
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	us, usTarget := resolveFixture(t, "ovh-us", map[int64][3]string{777: {"24ska01", "gra", "P1M"}})
 	runOrderResolver(us, usTarget, []time.Duration{0}, noSleep)
 	if got := taskStatus(us, "task-1"); got != "paused" {
@@ -141,7 +141,7 @@ func TestResolverSkipsClaimedOrdersAndUSAccounts(t *testing.T) {
 
 // 429 后满 1 分钟账户里没有任何新订单:自动恢复;只要出现新订单(哪怕不吻合)就保持暂停。
 func TestResolverAutoResumesAfterRateLimitOnlyWithNoNewOrders(t *testing.T) {
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target := resolveFixture(t, "ovh-eu", map[int64][3]string{})
 	target.autoResume = true
 	runOrderResolver(state, target, []time.Duration{30 * time.Second, 30 * time.Second}, noSleep)
@@ -149,7 +149,7 @@ func TestResolverAutoResumesAfterRateLimitOnlyWithNoNewOrders(t *testing.T) {
 		t.Fatalf("429 with no new orders should resume, got %q", got)
 	}
 
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target = resolveFixture(t, "ovh-eu", map[int64][3]string{900: {"other-plan", "rbx", "P1M"}})
 	target.autoResume = true
 	runOrderResolver(state, target, []time.Duration{30 * time.Second, 30 * time.Second}, noSleep)
@@ -157,14 +157,14 @@ func TestResolverAutoResumesAfterRateLimitOnlyWithNoNewOrders(t *testing.T) {
 		t.Fatalf("any new order must keep the task paused, got %q", got)
 	}
 
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target = resolveFixture(t, "ovh-eu", map[int64][3]string{})
 	runOrderResolver(state, target, []time.Duration{30 * time.Second, 30 * time.Second}, noSleep)
 	if got := taskStatus(state, "task-1"); got != "paused" {
 		t.Fatalf("non-429 uncertain results must never auto-resume, got %q", got)
 	}
 
-	resolver = &orderResolver{active: map[string]bool{}, claimed: map[string]bool{}}
+	resetResolverForTesting()
 	state, target = resolveFixture(t, "ovh-eu", map[int64][3]string{})
 	target.autoResume = true
 	runOrderResolver(state, target, []time.Duration{10 * time.Second}, noSleep)

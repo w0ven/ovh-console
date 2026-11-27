@@ -16,6 +16,7 @@ import (
 
 	"github.com/ovh-buy/server/internal/app"
 	"github.com/ovh-buy/server/internal/notify"
+	"github.com/ovh-buy/server/internal/telegram"
 	"github.com/ovh-buy/server/internal/updater"
 )
 
@@ -41,6 +42,7 @@ const (
 	updateCacheFailureTT    = 60 * time.Second
 	updatePollInterval      = 5 * time.Minute
 	kvUpdateLastNotifiedTag = "update_last_notified_tag"
+	kvUpdateIgnoredTag      = "update_ignored_tag"
 	updateNotifyMaxBackoff  = 6 * time.Hour
 )
 
@@ -65,7 +67,23 @@ func resetUpdateNotifyStateForTest() {
 	updateNotifyMu.Unlock()
 }
 
-// sanitizeReleaseBodyPlainText 剥离外部 Release body 中的 HTML 标签和控制字符并截断，确保纯文本安全展示。
+var (
+	fullChangelogOnlyRe = regexp.MustCompile(`(?im)^\s*\*?\*?full\s+changelog\*?\*?\s*:\s*https?://\S+\s*$`)
+	mdBoldRe            = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
+	mdHeadingRe         = regexp.MustCompile(`(?m)^#{1,6}\s+`)
+)
+
+// hasSubstantiveReleaseNotes 判断 Release body 是否包含实质更新说明（排除仅有一行 Full Changelog compare URL 的空壳）。
+func hasSubstantiveReleaseNotes(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return false
+	}
+	stripped := strings.TrimSpace(fullChangelogOnlyRe.ReplaceAllString(s, ""))
+	return stripped != ""
+}
+
+// sanitizeReleaseBodyPlainText 剥离外部 Release body 中的 HTML 标签、冗余 Markdown 标记和控制字符并截断，确保纯文本安全可读。
 func sanitizeReleaseBodyPlainText(raw string, maxRunes int) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -92,7 +110,15 @@ func sanitizeReleaseBodyPlainText(raw string, maxRunes int) string {
 		}
 		out.WriteRune(r)
 	}
-	clean := strings.TrimSpace(out.String())
+	clean := out.String()
+	// 已有实质说明时移掉末尾冗余的 "**Full Changelog**: https://..." 行；若整篇只有这一行则置空交由上层显示友善占位
+	withoutCompare := strings.TrimSpace(fullChangelogOnlyRe.ReplaceAllString(clean, ""))
+	if withoutCompare == "" {
+		return ""
+	}
+	clean = mdHeadingRe.ReplaceAllString(withoutCompare, "• ")
+	clean = mdBoldRe.ReplaceAllString(clean, "$1")
+	clean = strings.TrimSpace(clean)
 	runes := []rune(clean)
 	if maxRunes > 0 && len(runes) > maxRunes {
 		clean = string(runes[:maxRunes]) + "…"
@@ -110,31 +136,281 @@ func isTrustedReleaseURL(u string) bool {
 	return strings.HasPrefix(u, prefix)
 }
 
+// normalizeVersionTag 统一规范版本标签为不带 v 的纯版本号（如 "0.4.42"），空串表示未忽略任何版本。
+func normalizeVersionTag(tag string) string {
+	t := strings.TrimSpace(tag)
+	if t == "" {
+		return ""
+	}
+	if !strictReleaseTagRe.MatchString(t) {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(t, "v"), "V")
+}
+
+// getIgnoredVersion 读取用户持久化的已忽略版本号（不含 v 前缀）；未设置或已追上当前版本时返回空串。
+func getIgnoredVersion(state *app.State) string {
+	if state == nil || state.DB == nil {
+		return ""
+	}
+	var raw string
+	ok, err := state.DB.GetKV(kvUpdateIgnoredTag, &raw)
+	if err != nil || !ok {
+		return ""
+	}
+	ver := normalizeVersionTag(raw)
+	if ver == "" {
+		return ""
+	}
+	if Version != "dev" && !semverGreater(ver, Version) {
+		return ""
+	}
+	return ver
+}
+
+// setIgnoredVersion 设置或清空（tag=""）要忽略的新版本号。
+func setIgnoredVersion(state *app.State, tag string) (string, error) {
+	if state == nil || state.DB == nil {
+		return "", fmt.Errorf("数据库未就绪")
+	}
+	trimmed := strings.TrimSpace(tag)
+	if trimmed == "" {
+		if err := state.DB.SetKV(kvUpdateIgnoredTag, ""); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	ver := normalizeVersionTag(trimmed)
+	if ver == "" {
+		return "", fmt.Errorf("版本号格式无效（需如 v0.4.42 或 0.4.42）")
+	}
+	if err := state.DB.SetKV(kvUpdateIgnoredTag, "v"+ver); err != nil {
+		return "", err
+	}
+	return ver, nil
+}
+
+// IgnoreUpdate POST /api/version/ignore  body: {"version": "0.4.42"}（传空串取消忽略）
+func IgnoreUpdate(state *app.State) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			Version string `json:"version"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "参数格式不正确"})
+			return
+		}
+		ver, err := setIgnoredVersion(state, body.Version)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+			return
+		}
+		if ver == "" {
+			if state != nil && state.Logger != nil {
+				state.Logger.Info("已恢复新版本更新提醒", "version")
+			}
+		} else if state != nil && state.Logger != nil {
+			state.Logger.Info("已忽略版本更新提醒: v"+ver, "version")
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":         "success",
+			"ignoredVersion": ver,
+		})
+	}
+}
+
 // formatUpdateNotifyMessage 构造简洁清晰的纯文本新版本通知文案（按容器/裸机区分升级动作）。
-func formatUpdateNotifyMessage(current, latest, tag, relURL, body string, inContainer bool) string {
+func formatUpdateNotifyMessage(current, latest, tag, relURL, body string, inContainer bool, maxNotesRunes int) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("🆕 OVH 控制台发现新版本：v%s → %s\n", strings.TrimPrefix(current, "v"), tag))
-	if summary := sanitizeReleaseBodyPlainText(body, 400); summary != "" {
-		b.WriteString("\n更新说明：\n")
+	if summary := sanitizeReleaseBodyPlainText(body, maxNotesRunes); summary != "" {
+		b.WriteString("\n📋 更新内容：\n")
 		b.WriteString(summary)
 		b.WriteString("\n")
+	} else {
+		b.WriteString("\n📋 更新内容：\n本次发行版未附详细变更条目，可点击下方链接查看代码对比。\n")
 	}
 	if isTrustedReleaseURL(relURL) {
-		b.WriteString("\n发布页：")
+		b.WriteString("\n🔗 发布页：")
 		b.WriteString(strings.TrimSpace(relURL))
 		b.WriteString("\n")
 	}
 	if inContainer {
-		b.WriteString("\n容器升级命令：\ndocker compose pull && docker compose up -d")
+		b.WriteString("\n🐳 容器升级命令：\ndocker compose pull && docker compose up -d")
 	} else {
-		b.WriteString("\n可在 Web 控制台右上角点击版本入口查看并更新。")
+		b.WriteString("\n💡 可在 Web 控制台右上角点击版本号查看完整说明并一键更新。")
 	}
 	return b.String()
 }
 
+// buildUpdateNotifyKeyboard 为 Telegram 新版本通知生成内联按钮：展开完整更新内容 / 忽略此版本 / GitHub 发布页。
+// 严格控制在 64 字节 callback_data 上限内：{"a":"up","o":"d","t":"v0.4.42"} 仅约 32 字节。
+func buildUpdateNotifyKeyboard(tag, relURL string, expanded, ignored bool) map[string]interface{} {
+	norm := normalizeVersionTag(tag)
+	if norm == "" {
+		return nil
+	}
+	vTag := "v" + norm
+	var rows [][]map[string]interface{}
+	if !ignored {
+		var actionRow []map[string]interface{}
+		if !expanded {
+			actionRow = append(actionRow, cbButton("📖 完整更新内容", map[string]string{"a": "up", "o": "d", "t": vTag}))
+		}
+		actionRow = append(actionRow, cbButton("🙈 忽略此版本", map[string]string{"a": "up", "o": "i", "t": vTag}))
+		rows = append(rows, actionRow)
+	} else {
+		rows = append(rows, []map[string]interface{}{
+			cbButton("🔔 取消忽略 "+vTag, map[string]string{"a": "up", "o": "u", "t": vTag}),
+		})
+	}
+	if isTrustedReleaseURL(relURL) {
+		rows = append(rows, []map[string]interface{}{
+			{"text": "🌐 GitHub Release", "url": strings.TrimSpace(relURL)},
+		})
+	}
+	return keyboard(rows)
+}
+
+// handleUpdateCallback 处理 Telegram 新版本通知上的内联按钮（查看完整更新内容 / 忽略此版本 / 取消忽略）及菜单检查更新。
+func handleUpdateCallback(state *app.State, cb, obj map[string]interface{}, chatID interface{}, messageID int64) {
+	op := strOr(obj, "o")
+	rawTag := strOr(obj, "t")
+	norm := normalizeVersionTag(rawTag)
+	vTag := ""
+	if norm != "" {
+		vTag = "v" + norm
+	}
+
+	url := updater.LatestReleaseURL()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	res, ok := releaseCheckCache.fetch(ctx, ctx, url, state, false)
+	cancel()
+
+	switch op {
+	case "i": // 忽略此版本
+		if norm == "" {
+			telegram.AnswerCallback(state, idToString(cb["id"]), "版本号无效", true)
+			return
+		}
+		if _, err := setIgnoredVersion(state, vTag); err != nil {
+			telegram.AnswerCallback(state, idToString(cb["id"]), "保存失败: "+err.Error(), true)
+			return
+		}
+		telegram.AnswerCallback(state, idToString(cb["id"]), "已忽略 "+vTag+"（Web 与 TG 同步生效）", false)
+		relURL := ""
+		body := ""
+		if ok && res.ok && normalizeVersionTag(res.release.TagName) == norm {
+			relURL = res.release.HTMLURL
+			body = res.release.Body
+		}
+		text := fmt.Sprintf("🙈 已忽略版本 %s 的更新提醒（Web 控制台顶栏红点已同步隐藏；发布下一新版本时会自动恢复提醒）。", vTag)
+		if summary := sanitizeReleaseBodyPlainText(body, 600); summary != "" {
+			text += "\n\n📋 该版本更新内容备忘：\n" + summary
+		}
+		telegram.EditMessage(state, chatID, messageID, clampReply(text), buildUpdateNotifyKeyboard(vTag, relURL, true, true))
+
+	case "u": // 取消忽略
+		if _, err := setIgnoredVersion(state, ""); err != nil {
+			telegram.AnswerCallback(state, idToString(cb["id"]), "操作失败: "+err.Error(), true)
+			return
+		}
+		telegram.AnswerCallback(state, idToString(cb["id"]), "已恢复版本更新提醒", false)
+		if ok && res.ok {
+			tag := strings.TrimSpace(res.release.TagName)
+			latest := strings.TrimPrefix(tag, "v")
+			msg := formatUpdateNotifyMessage(Version, latest, tag, res.release.HTMLURL, res.release.Body, updater.InContainer(), 2600)
+			telegram.EditMessage(state, chatID, messageID, clampReply(msg), buildUpdateNotifyKeyboard(tag, res.release.HTMLURL, true, false))
+			return
+		}
+		telegram.EditMessage(state, chatID, messageID, "🔔 已恢复版本更新提醒。", nil)
+
+	case "d": // 展开完整更新内容
+		if !ok || !res.ok {
+			telegram.AnswerCallback(state, idToString(cb["id"]), "暂时无法读取更新说明，请稍后再试", true)
+			return
+		}
+		tag := strings.TrimSpace(res.release.TagName)
+		latest := strings.TrimPrefix(tag, "v")
+		ignored := getIgnoredVersion(state) == latest
+		msg := formatUpdateNotifyMessage(Version, latest, tag, res.release.HTMLURL, res.release.Body, updater.InContainer(), 2800)
+		telegram.AnswerCallback(state, idToString(cb["id"]), "已展开完整更新说明", false)
+		telegram.EditMessage(state, chatID, messageID, clampReply(msg), buildUpdateNotifyKeyboard(tag, res.release.HTMLURL, true, ignored))
+
+	default:
+		telegram.AnswerCallback(state, idToString(cb["id"]), "未知操作", false)
+	}
+}
+
+// versionCommandText 供 Telegram `/version` 或菜单「版本更新」查看当前版本、最新更新说明与忽略状态。
+func versionCommandTextAndKeyboard(state *app.State, withMenuBack bool) (string, map[string]interface{}) {
+	url := updater.LatestReleaseURL()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	res, ok := releaseCheckCache.fetch(ctx, ctx, url, state, false)
+	cancel()
+
+	cur := strings.TrimPrefix(Version, "v")
+	if !ok || !res.ok {
+		errDetail := "上游暂时不可达"
+		if ok && res.errMsg != "" {
+			errDetail = res.errMsg
+		}
+		txt := fmt.Sprintf("📦 版本信息\n\n当前版本：v%s\n更新检查：%s", cur, errDetail)
+		if withMenuBack {
+			return txt, keyboard([][]map[string]interface{}{menuBack()})
+		}
+		return txt, nil
+	}
+
+	tag := strings.TrimSpace(res.release.TagName)
+	latest := strings.TrimPrefix(tag, "v")
+	hasUpdate := Version != "dev" && semverGreater(latest, Version)
+	ignoredVer := getIgnoredVersion(state)
+	isIgnored := hasUpdate && ignoredVer == latest
+
+	var b strings.Builder
+	b.WriteString("📦 版本与更新\n\n")
+	b.WriteString(fmt.Sprintf("当前版本：v%s\n最新版本：%s", cur, tag))
+	if hasUpdate {
+		if isIgnored {
+			b.WriteString("（已忽略提醒）\n")
+		} else {
+			b.WriteString("（🆕 有可用更新）\n")
+		}
+	} else {
+		b.WriteString("（✅ 已是最新）\n")
+	}
+	if summary := sanitizeReleaseBodyPlainText(res.release.Body, 2400); summary != "" {
+		b.WriteString("\n📋 更新内容：\n")
+		b.WriteString(summary)
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n📋 更新内容：\n该发行版暂无详细文字条目。\n")
+	}
+	if isTrustedReleaseURL(res.release.HTMLURL) {
+		b.WriteString("\n🔗 发布页：" + strings.TrimSpace(res.release.HTMLURL) + "\n")
+	}
+	if hasUpdate && updater.InContainer() {
+		b.WriteString("\n🐳 容器升级命令：\ndocker compose pull && docker compose up -d")
+	}
+
+	var kb map[string]interface{}
+	if hasUpdate {
+		kb = buildUpdateNotifyKeyboard(tag, res.release.HTMLURL, true, isIgnored)
+	} else if isTrustedReleaseURL(res.release.HTMLURL) {
+		kb = keyboard([][]map[string]interface{}{
+			{{"text": "🌐 GitHub Release", "url": strings.TrimSpace(res.release.HTMLURL)}},
+		})
+	}
+	if withMenuBack {
+		kb = withBack(kb)
+	}
+	return b.String(), kb
+}
+
 // maybeNotifyNewRelease 按“状态驱动”规则决定是否发送新版本通知：
 //   - 无论本次结果来自新 200、304 复用还是已有缓存快照，只要满足 Version != "dev"、非 prerelease/draft、
-//     semverGreater(latest, Version) 且未通知过该 tag，即触发检查；
+//     semverGreater(latest, Version)、未被用户忽略且未通知过该 tag，即触发检查；
 //   - 若用户未配置任何通知通道，静默跳过；
 //   - 若发送全部失败，按指数退避（5m → 10m → 20m … 上限 6h）避免重试风暴；
 //   - 只要至少 1 个通道实际送达成功（sent > 0），立即在内存和 SQLite kv 中记为已通知（即使 SetKV 失败，本进程也不重复刷屏）。
@@ -150,6 +426,9 @@ func maybeNotifyNewRelease(state *app.State, res updateCheckResult) bool {
 	}
 	latest := strings.TrimPrefix(tag, "v")
 	if Version == "dev" || !semverGreater(latest, Version) {
+		return false
+	}
+	if getIgnoredVersion(state) == latest {
 		return false
 	}
 
@@ -177,8 +456,11 @@ func maybeNotifyNewRelease(state *app.State, res updateCheckResult) bool {
 		return false
 	}
 
-	msg := formatUpdateNotifyMessage(Version, latest, tag, res.release.HTMLURL, res.release.Body, updater.InContainer())
-	sent, _ := updateNotifyBroadcastFn(state, msg, nil)
+	msg := formatUpdateNotifyMessage(Version, latest, tag, res.release.HTMLURL, res.release.Body, updater.InContainer(), 800)
+	fullPlain := sanitizeReleaseBodyPlainText(res.release.Body, 0)
+	alreadyComplete := len([]rune(fullPlain)) <= 800
+	kb := buildUpdateNotifyKeyboard(tag, res.release.HTMLURL, alreadyComplete, false)
+	sent, _ := updateNotifyBroadcastFn(state, msg, kb)
 	if sent <= 0 {
 		if updateNotifyFailTag != tag {
 			updateNotifyFailTag = tag
@@ -542,19 +824,23 @@ func CheckUpdate(state *app.State) gin.HandlerFunc {
 
 		latest := strings.TrimPrefix(res.release.TagName, "v")
 		hasUpdate := Version != "dev" && semverGreater(latest, Version)
+		ignoredVer := getIgnoredVersion(state)
+		ignored := hasUpdate && ignoredVer != "" && ignoredVer == latest
 
 		c.JSON(http.StatusOK, gin.H{
-			"current":     Version,
-			"latest":      latest,
-			"tag":         res.release.TagName,
-			"name":        res.release.Name,
-			"hasUpdate":   hasUpdate,
-			"url":         res.release.HTMLURL,
-			"publishedAt": res.release.PublishedAt,
-			"body":        res.release.Body,
-			"prerelease":  res.release.Prerelease,
-			"checkedAt":   res.checkedAt,
-			"lastError":   res.lastError,
+			"current":        Version,
+			"latest":         latest,
+			"tag":            res.release.TagName,
+			"name":           res.release.Name,
+			"hasUpdate":      hasUpdate,
+			"ignored":        ignored,
+			"ignoredVersion": ignoredVer,
+			"url":            res.release.HTMLURL,
+			"publishedAt":    res.release.PublishedAt,
+			"body":           res.release.Body,
+			"prerelease":     res.release.Prerelease,
+			"checkedAt":      res.checkedAt,
+			"lastError":      res.lastError,
 			// 容器里自更新是停用的 —— 界面据此把"立即更新"换成"怎么拉新镜像",
 			// 而不是给一个点了必然失败的按钮。
 			"inContainer": updater.InContainer(),

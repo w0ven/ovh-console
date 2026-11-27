@@ -183,6 +183,10 @@ func handleTelegramCallback(state *app.State, mon *monitor.Monitor, u *updateCtx
 		handleActionCallback(state, mon, cb, callbackObj, chatID, int64(messageID))
 		u.JSON(http.StatusOK, gin.H{"ok": true, "handled": "action"})
 		return
+	case "up":
+		handleUpdateCallback(state, cb, callbackObj, chatID, int64(messageID))
+		u.JSON(http.StatusOK, gin.H{"ok": true, "handled": "update"})
+		return
 	case "qa":
 		answer := pauseAllText(state)
 		telegram.AnswerCallback(state, idToString(cb["id"]), "", false)

@@ -86,6 +86,7 @@ export const watchPagesZh = {
       empty: "暂无历史记录",
       available: "有货",
       unavailable: "无货",
+      priceCheckFailed: "询价失败",
     },
     dialog: {
       editTitle: "编辑订阅",
@@ -212,6 +213,7 @@ export const watchPagesZh = {
       empty: "暂无历史记录",
       available: "有货",
       unavailable: "无货",
+      priceCheckFailed: "询价失败",
     },
     dialog: {
       editTitle: "编辑 VPS 订阅",

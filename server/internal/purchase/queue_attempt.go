@@ -146,6 +146,7 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 		for i := range state.Queue {
 			if state.Queue[i].ID == it.ID {
 				state.Queue[i].Status = "paused"
+				state.Queue[i].OrderPhase = ""
 				state.Queue[i].StopReason = outcome.GroupStopped
 				state.Queue[i].UpdatedAt = types.NowISO()
 				break
@@ -164,6 +165,7 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 		for i := range state.Queue {
 			if state.Queue[i].ID == it.ID {
 				state.Queue[i].Status = "paused"
+				state.Queue[i].OrderPhase = ""
 				state.Queue[i].StopReason = app.StopReasonCheckoutUncertain
 				state.Queue[i].UpdatedAt = types.NowISO()
 				break
@@ -218,11 +220,14 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 		for i := range state.Queue {
 			if state.Queue[i].ID == it.ID {
 				state.Queue[i].FailureCount++
+				state.Queue[i].OrderPhase = ""
 				failureCount = state.Queue[i].FailureCount
 				break
 			}
 		}
 		state.QueueMu.Unlock()
+	} else {
+		setOrderPhase(state, it.ID, "")
 	}
 
 	// 以前这里只打一行日志就完了:任务状态永远停在 running,
@@ -271,6 +276,7 @@ func runQueueAttempt(ctx context.Context, state *app.State, it types.QueueItem, 
 	for i := range state.Queue {
 		if state.Queue[i].ID == it.ID {
 			state.Queue[i].Status = "failed"
+			state.Queue[i].OrderPhase = ""
 			state.Queue[i].UpdatedAt = types.NowISO()
 			break
 		}

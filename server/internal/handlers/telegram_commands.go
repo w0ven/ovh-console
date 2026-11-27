@@ -106,6 +106,13 @@ func handleCommand(state *app.State, mon *monitor.Monitor, chatID interface{}, m
 			return true
 		}
 		reply = recentText(state)
+	case "version", "ver", "update":
+		txt, kb := versionCommandTextAndKeyboard(state, false)
+		if kb != nil {
+			telegram.SendKeyboard(state, chatID, messageID, clampReply(txt), kb)
+			return true
+		}
+		reply = txt
 	default:
 		reply = "❓ 不认识的命令: /" + cmd + "\n\n发 /help 看能用什么。"
 	}
@@ -161,7 +168,8 @@ func helpText() string {
 	b.WriteString("  /interval [秒]   看/改新任务的默认重试间隔\n")
 	b.WriteString("  /subs     在盯哪些型号（可暂停/恢复/删除）\n")
 	b.WriteString("  /accounts 看/切当前下单账户\n")
-	b.WriteString("  /recent   最近的抢购结果（未付款订单带订单页链接）\n\n")
+	b.WriteString("  /recent   最近的抢购结果（未付款订单带订单页链接）\n")
+	b.WriteString("  /version  查看当前版本、更新说明或忽略提醒\n\n")
 	b.WriteString("💡 上架通知里的按钮可以直接下单，比打字快。\n")
 	b.WriteString("💡 多账户的话先 /accounts 确认当前用的是哪个 —— ")
 	b.WriteString("三个大区的型号代码不一样，选错区永远抢不到。\n")

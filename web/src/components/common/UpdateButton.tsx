@@ -12,6 +12,7 @@ import {
 import {
   DEFAULT_RESTART_DEADLINE_MS,
   DEFAULT_RESTART_POLL_INTERVAL_MS,
+  openVersionUpdateDialog,
   resolveUpdateProgressTransition,
   runBoundedRestartWait,
 } from "@/components/common/VersionUpdateTrigger";
@@ -169,24 +170,21 @@ export function UpdateButton({
     }
   };
 
-  // 没有新版本就不显示任何东西
-  if (!check?.hasUpdate && !started && !waitingRestart && !failed) return null;
+  // 没有新版本（或用户已忽略该版本提醒）就不显示高亮更新提示
+  if ((!check?.hasUpdate || check?.ignored) && !started && !waitingRestart && !failed) return null;
 
-  // 容器里不给更新按钮 —— 点了必然被后端拒。
-  //
-  // 容器里的自更新是错的：新二进制只会写进容器的可写层，容器一重建
-  // （compose up -d、重启策略拉起、宿主机重启）就回到镜像里的旧版本，
-  // 用户会看到「更新成功」之后版本号又变回去。
-  // 所以这里显示的是"有新版 + 怎么拉新镜像"，而不是一个坏按钮。
+  // 容器里不给更新按钮 —— 点击高亮胶囊直接打开「版本与更新」弹窗看完整说明和升级命令。
   if (check?.inContainer) {
     return (
-      <span
-        className="inline-flex items-center gap-1.5 text-[11px] text-primary cursor-help whitespace-nowrap"
-        title={check.updateHint || t("commons.update.containerHint")}
+      <button
+        type="button"
+        onClick={openVersionUpdateDialog}
+        className="inline-flex items-center gap-1.5 text-[11px] text-primary hover:underline cursor-pointer whitespace-nowrap"
+        title={t("commons.update.latestTitle", { version: check.latest })}
       >
         <Sparkles className="w-3 h-3" />
         {t("commons.update.containerBadge", { version: check.latest })}
-      </span>
+      </button>
     );
   }
 
@@ -234,16 +232,15 @@ export function UpdateButton({
 
   return (
     <span className="inline-flex items-center gap-1.5">
-      <a
-        href={check!.url}
-        target="_blank"
-        rel="noreferrer noopener"
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
+      <button
+        type="button"
+        onClick={openVersionUpdateDialog}
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary/10 text-primary hover:bg-primary/20 transition-colors cursor-pointer"
         title={t("commons.update.latestTitle", { version: check!.latest })}
       >
         <Sparkles className="w-3 h-3" />
         v{check!.latest}
-      </a>
+      </button>
       <Button size="sm" variant="outline" className="h-6 px-2 text-[11px]" onClick={start} disabled={mut.isPending}>
         {mut.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3 mr-1" />}
         {t("commons.update.updateNow")}

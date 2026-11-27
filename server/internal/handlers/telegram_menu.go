@@ -107,6 +107,7 @@ func menuKeyboard(mon *monitor.Monitor) map[string]interface{} {
 		{cbButton("📊 总览", map[string]string{"a": "m", "c": "status"}), cbButton("🛒 任务", map[string]string{"a": "m", "c": "queue"})},
 		{cbButton("🔔 订阅", map[string]string{"a": "m", "c": "subs"}), cbButton("📜 最近订单", map[string]string{"a": "m", "c": "recent"})},
 		{cbButton("⏱ 抢购速度", map[string]string{"a": "m", "c": "speed"}), toggle},
+		{cbButton("📦 版本更新", map[string]string{"a": "m", "c": "version"})},
 	})
 }
 
@@ -128,6 +129,8 @@ func menuPage(state *app.State, mon *monitor.Monitor, page string) (string, map[
 		return recentText(state), withBack(recentKeyboard(state))
 	case "speed":
 		return speedText(state), keyboard([][]map[string]interface{}{menuBack()})
+	case "version":
+		return versionCommandTextAndKeyboard(state, true)
 	default:
 		return menuText(mon), menuKeyboard(mon)
 	}

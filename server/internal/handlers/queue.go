@@ -78,7 +78,12 @@ func AddQueueItem(state *app.State) gin.HandlerFunc {
 		}
 		seen := map[string]bool{}
 		for i, dc := range body.Datacenters {
-			dc = ovh.ConvertDisplayDCToAPIDC(strings.TrimSpace(dc))
+			trimmed := strings.TrimSpace(dc)
+			if trimmed == "" {
+				c.JSON(400, gin.H{"error": "机房不能为空或重复"})
+				return
+			}
+			dc = ovh.ConvertDisplayDCToAPIDC(trimmed)
 			if dc == "" || seen[dc] {
 				c.JSON(400, gin.H{"error": "机房不能为空或重复"})
 				return
@@ -219,7 +224,7 @@ func UpdateQueueItem(state *app.State) gin.HandlerFunc {
 				return
 			}
 		}
-		if err := state.UpdateQueueItem(c.Param("id"), strings.TrimSpace(body.Datacenter), body.Options, body.RetryInterval, body.AutoPay, strings.TrimSpace(body.Coupon), body.Duration); err != nil {
+		if err := state.UpdateQueueItem(c.Param("id"), ovh.ConvertDisplayDCToAPIDC(strings.TrimSpace(body.Datacenter)), body.Options, body.RetryInterval, body.AutoPay, strings.TrimSpace(body.Coupon), body.Duration); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, app.ErrQueueNotFound) {
 				status = http.StatusNotFound
@@ -230,6 +235,130 @@ func UpdateQueueItem(state *app.State) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "success"})
+	}
+}
+
+// UpdateQueueBundle PUT /api/queue/bundle:整单修改配置与数量(见 app.UpdateQueueBundle)。
+func UpdateQueueBundle(state *app.State) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			IDs           []string       `json:"ids"`
+			Options       []string       `json:"options"`
+			Duration      *string        `json:"duration"`
+			RetryInterval int            `json:"retryInterval"`
+			AutoPay       bool           `json:"autoPay"`
+			Coupon        string         `json:"coupon"`
+			Quantities    map[string]int `json:"quantities"`
+			Total         int            `json:"total"`
+			Datacenters   []string       `json:"datacenters"`
+		}
+		if err := bindOrderJSON(c, &body); err != nil || len(body.IDs) == 0 || len(body.IDs) > 2000 ||
+			(body.RetryInterval != 0 && (body.RetryInterval < types.MinRetryInterval || body.RetryInterval > types.MaxRetryInterval)) {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "请求无效:请检查任务和重试间隔"})
+			return
+		}
+		if body.Duration != nil {
+			if _, err := orderterm.Normalize(*body.Duration); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+				return
+			}
+		}
+		normDcs := make([]string, 0, len(body.Datacenters))
+		for _, dc := range body.Datacenters {
+			trimmed := strings.TrimSpace(dc)
+			if trimmed == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "机房不能为空"})
+				return
+			}
+			normDcs = append(normDcs, ovh.ConvertDisplayDCToAPIDC(trimmed))
+		}
+		var normQty map[string]int
+		if body.Quantities != nil {
+			normQty = make(map[string]int, len(body.Quantities))
+			for dc, n := range body.Quantities {
+				trimmed := strings.TrimSpace(dc)
+				if trimmed == "" {
+					c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "机房不能为空"})
+					return
+				}
+				norm := ovh.ConvertDisplayDCToAPIDC(trimmed)
+				if n > 0 {
+					normQty[norm] += n
+				} else if _, exists := normQty[norm]; !exists {
+					// 保留 0 值键但不覆盖同名别名已累加的正数（如 {"par-a":2, "eu-west-par-a":0}）
+					normQty[norm] = 0
+				}
+			}
+		}
+		// 整单编辑与新建队列任务保持一致的目录机房校验（非预售任务拒绝明确不在当前子公司目录里的机房）。
+		if accID, planCode, preorder, ok := state.InspectQueueBundleMeta(body.IDs); ok && !preorder {
+			acc, _ := state.FindAccount(accID)
+			sub := catalog.SubsidiaryOfAccount(acc)
+			checkDC := func(dc string) (string, bool) {
+				if dcVerdict, dcs := catalog.ClassifyDatacenter(state, accID, planCode, dc); dcVerdict == catalog.DatacenterVerdictOutOfCatalog {
+					return catalog.FormatOutOfCatalogDatacenterMessage(sub, planCode, dc, dcs), false
+				}
+				return "", true
+			}
+			for _, dc := range normDcs {
+				if hint, valid := checkDC(dc); !valid {
+					state.Logger.Warn(fmt.Sprintf("[queue] 整单修改拒绝机房(不在目录): %s", hint), "queue")
+					c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": hint, "account_id": accID})
+					return
+				}
+			}
+			for dc, n := range normQty {
+				if n <= 0 {
+					continue
+				}
+				if hint, valid := checkDC(dc); !valid {
+					state.Logger.Warn(fmt.Sprintf("[queue] 整单修改拒绝机房(不在目录): %s", hint), "queue")
+					c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": hint, "account_id": accID})
+					return
+				}
+			}
+		}
+		res, err := state.UpdateQueueBundle(app.BundleUpdate{
+			IDs: body.IDs, Options: body.Options, Duration: body.Duration, RetryInterval: body.RetryInterval,
+			AutoPay: body.AutoPay, Coupon: body.Coupon, Quantities: normQty, Total: body.Total, Datacenters: normDcs,
+		})
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, app.ErrQueueNotFound):
+				status = http.StatusNotFound
+			case errors.Is(err, app.ErrBundleUncertainBusy):
+				status = http.StatusConflict
+			case errors.Is(err, app.ErrBundleMixed), errors.Is(err, app.ErrBundleNoTarget), errors.Is(err, app.ErrBundleTooLarge), errors.Is(err, app.ErrBundleQueueFull):
+				status = http.StatusBadRequest
+			}
+			c.JSON(status, gin.H{"status": "error", "error": err.Error()})
+			return
+		}
+		state.Logger.Info(fmt.Sprintf("整单修改:更新 %d、新增 %d、删除 %d", res.Updated, res.Added, res.Removed), "queue")
+		c.JSON(http.StatusOK, gin.H{"status": "success", "updated": res.Updated, "added": res.Added, "removed": res.Removed})
+	}
+}
+
+// UpdateQueueAutoPay PUT /api/queue/autopay  body: { "ids": [...], "autoPay": true|false }
+// 只切换自动付款,不动其他配置;已下单的任务忽略。
+func UpdateQueueAutoPay(state *app.State) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			IDs     []string `json:"ids"`
+			AutoPay *bool    `json:"autoPay"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.AutoPay == nil || len(body.IDs) == 0 || len(body.IDs) > 1000 {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "请选择任务并指定是否自动付款"})
+			return
+		}
+		n, err := state.SetQueueAutoPay(body.IDs, *body.AutoPay)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": err.Error()})
+			return
+		}
+		state.Logger.Info(fmt.Sprintf("%d 个任务自动付款改为 %v", n, *body.AutoPay), "queue")
+		c.JSON(http.StatusOK, gin.H{"status": "success", "updated": n})
 	}
 }
 

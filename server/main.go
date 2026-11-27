@@ -826,6 +826,8 @@ func main() {
 		api.GET("/purchase/prewarm", handlers.GetOrderPrewarm(state))
 		api.DELETE("/purchase/prewarm/:id", handlers.CancelOrderPrewarm(state))
 		api.DELETE("/queue/clear", handlers.ClearQueue(state))
+		api.PUT("/queue/bundle", handlers.UpdateQueueBundle(state))
+		api.PUT("/queue/autopay", handlers.UpdateQueueAutoPay(state))
 		api.DELETE("/queue/:id", handlers.RemoveQueueItem(state))
 		api.PUT("/queue/:id", handlers.UpdateQueueItem(state))
 		api.PUT("/queue/:id/status", handlers.UpdateQueueStatus(state))
@@ -883,6 +885,7 @@ func main() {
 		api.GET("/app/devices", auth.RequireMasterKey(), handlers.ListAppDevices(state))
 		api.DELETE("/app/devices/:id", auth.RequireMasterKey(), handlers.RevokeAppDevice(state))
 		api.GET("/version/check-update", handlers.CheckUpdate(state))
+		api.POST("/version/ignore", handlers.IgnoreUpdate(state))
 		// 在线更新:下载 → 校验 → 替换自己 → 自动重启。gracefulRestart 在下面赋值,
 		// 这里用闭包间接引用,避免"路由要在 server 之前注册、server 又要在路由之后创建"的鸡生蛋
 		api.POST("/version/update", handlers.SelfUpdate(state, func(exe string) { gracefulRestart(exe) }))
@@ -1134,6 +1137,7 @@ func main() {
 		api.GET("/ovh/support/tickets/:ticket_id", handlers.GetSupportTicket(state))
 		api.POST("/ovh/support/tickets/:ticket_id", handlers.UpdateSupportTicket(state))
 		api.GET("/ovh/account/orders", handlers.GetAccountOrders(state))
+		api.GET("/ovh/account/orders/:order_id/tracking", handlers.GetOrderTracking(state))
 		api.GET("/ovh/account/orders/:order_id/payment", handlers.GetOrderPaymentOptions(state))
 		api.POST("/ovh/account/orders/:order_id/pay", handlers.PayAccountOrder(state))
 		api.POST("/ovh/account/orders/:order_id/pay-balance", handlers.PayAccountOrderWithBalance(state))

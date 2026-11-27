@@ -9,6 +9,7 @@ import { useStats } from "@/hooks/use-stats";
 import { useQueueList, type QueueStatus } from "@/hooks/use-queue";
 import { useSystemMetrics, useAppVersion, useUpdateCheck } from "@/hooks/use-system-metrics";
 import { UpdateButton } from "@/components/common/UpdateButton";
+import { openVersionUpdateDialog } from "@/components/common/VersionUpdateTrigger";
 import { StatusDot } from "@/components/common/StatusDot";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -445,9 +446,14 @@ export function DashboardPearl() {
           </div>
           <div className="px-5 py-3 border-t border-border flex flex-wrap items-center gap-x-2 gap-y-2">
             <span className="text-xs text-muted-foreground">{t("dashboard.systemVersion")}</span>
-            <span className="font-mono text-xs px-1.5 py-0.5 rounded-md bg-muted" title={version.isError ? t("dashboard.versionFailedTitle", { error: String(version.error) }) : undefined}>
+            <button
+              type="button"
+              onClick={openVersionUpdateDialog}
+              className="font-mono text-xs px-1.5 py-0.5 rounded-md bg-muted hover:bg-muted/80 transition-colors cursor-pointer"
+              title={version.isError ? t("dashboard.versionFailedTitle", { error: String(version.error) }) : t("commons.update.pillTitleCurrent")}
+            >
               v{version.data || "—"}
-            </span>
+            </button>
             <span className="ml-auto inline-flex">
               <UpdateButton check={update.data} />
             </span>
